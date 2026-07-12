@@ -17,7 +17,16 @@ Usage:
   data = ProgressTracker.read("/path/to/progress.json")
 """
 
-import fcntl
+try:
+    import fcntl
+except ModuleNotFoundError:
+    # Windows fallback — no-op locking
+    import msvcrt as _msvcrt
+    class _FcntlShim:
+        LOCK_SH = 0; LOCK_EX = 0; LOCK_UN = 0
+        @staticmethod
+        def flock(fd, op): pass
+    fcntl = _FcntlShim()
 import json
 import os
 import time
