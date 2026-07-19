@@ -45,7 +45,8 @@ import pandas as pd
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from scripts.shared import DailyCache, PROJECT_ROOT, VALUATION_INDEX_PATH, fetch_daily, expected_trade_date
+from scripts.shared import PROJECT_ROOT, VALUATION_INDEX_PATH, expected_trade_date
+from scripts.data.market_data_service import MarketDataService
 from scripts.strategy_config import load_strategy_config
 
 
@@ -56,10 +57,12 @@ QUANT_DIR = os.path.join(PROJECT_ROOT, "quant")
 QUANT_RUNS_DIR = os.path.join(PROJECT_ROOT, "cache", "quant_runs")
 QUANT_STRATEGY_FILE = "02-quant.json"
 QUANT_STRATEGY, QUANT_STRATEGY_PATH = load_strategy_config(QUANT_STRATEGY_FILE)
+MARKET_DATA_CONFIG, _ = load_strategy_config("market-regime.json")
 STRATEGY_VERSION = QUANT_STRATEGY["strategy_version"]
 
 VCP_CFG = QUANT_STRATEGY["vcp"]
 POST_BREAKOUT_CFG = VCP_CFG["post_breakout"]
+POST_GROUP_RESET_CFG = VCP_CFG["post_group_reset"]
 BASE_CFG = QUANT_STRATEGY["base_rules"]
 CONTRACTION_CFG = QUANT_STRATEGY["contraction_rules"]
 STAGE_CFG = QUANT_STRATEGY["stage_rules"]
@@ -603,6 +606,55 @@ def _check_bottom_lifting(contractions, threshold_pct=0.0):
     return last_low >= first_low * (1 + threshold_pct / 100)
 
 
+def detect_post_group_support_break(df, last_end_idx, last_low):
+    """Return a confirmed pre-breakout support break after a candidate VCP group.
+
+    This is intentionally stricter than an ordinary stop: it requires consecutive
+    closes below the buffered last contraction low and a separate deep-close
+    confirmation, so normal pullbacks cannot invalidate a historical group.
+    """
+    cfg = POST_GROUP_RESET_CFG
+    if not cfg.get("enabled", False) or not last_low:
+        return None
+
+    start_idx = last_end_idx + 1
+    end_idx = min(len(df), start_idx + int(cfg["max_days_after_group"]))
+    after = df.iloc[start_idx:end_idx]
+    if after.empty:
+        return None
+
+    close_break = last_low * float(cfg["close_break_ratio"])
+    deep_break = last_low * float(cfg["deep_break_close_ratio"])
+    min_consecutive = int(cfg["min_consecutive_close_days"])
+    consecutive = 0
+    first_break_date = None
+    confirmed_first_break_date = None
+    confirmed_date = None
+
+    for _, row in after.iterrows():
+        if row["close"] < close_break:
+            consecutive += 1
+            if consecutive == 1:
+                first_break_date = str(row["date"])
+            if consecutive >= min_consecutive and confirmed_date is None:
+                confirmed_date = str(row["date"])
+                confirmed_first_break_date = first_break_date
+        else:
+            consecutive = 0
+            first_break_date = None
+
+    if confirmed_date is None or float(after["close"].min()) >= deep_break:
+        return None
+    return {
+        "first_break_date": confirmed_first_break_date,
+        "confirmed_date": confirmed_date,
+        "confirmed_idx": int(after.index[after["date"] == confirmed_date][0]),
+        "lowest_close": float(after["close"].min()),
+        "close_break": close_break,
+        "deep_break": deep_break,
+    }
+
+
 def evaluate_vcp_group(df, group):
     latest = df.iloc[-1]
     close = latest["close"]
@@ -652,12 +704,19 @@ def evaluate_vcp_group(df, group):
             post_breakout_state = "POST_BREAKOUT_CONSOLIDATING"
 
     invalid_reasons = []
+    post_group_support_break = None
+    # A completed breakout has its own lifecycle rules. This guard is only for a
+    # pre-breakout historical group whose support was subsequently destroyed.
+    if not breakout:
+        post_group_support_break = detect_post_group_support_break(df, last_end_idx, last_low)
     if structure_age_days > VCP_MAX_STRUCTURE_AGE_DAYS:
         invalid_reasons.append("structure_too_old")
     if pivot_distance is not None and pivot_distance < VCP_MIN_PIVOT_DISTANCE:
         invalid_reasons.append("far_below_structure_pivot")
     if not breakout and post_structure_gain > VCP_MAX_POST_GAIN:
         invalid_reasons.append("post_structure_extended")
+    if post_group_support_break:
+        invalid_reasons.append("post_group_support_break")
     if post_breakout_state == "POST_BREAKOUT_FAILED":
         invalid_reasons.append("post_structure_drawdown")
     if post_breakout_state == "POST_BREAKOUT_EXPIRED":
@@ -676,6 +735,7 @@ def evaluate_vcp_group(df, group):
         "post_structure_gain": post_structure_gain,
         "post_structure_drawdown": post_structure_drawdown,
         "post_breakout_state": post_breakout_state,
+        "post_group_support_break": post_group_support_break,
         "breakout": breakout,
         "breakout_days": breakout_days,
     }
@@ -689,6 +749,7 @@ def select_current_vcp_group(df, contractions):
     latest = df.iloc[-1]
     candidates = []
     best_invalid = None
+    reset_events = []
     active_cluster = split_contraction_clusters(contractions)[-1]
     max_size = min(CONTRACTION_CFG["max_recent_contractions"], len(active_cluster))
     max_span = CONTRACTION_CFG.get("max_group_span_days")
@@ -700,6 +761,8 @@ def select_current_vcp_group(df, contractions):
             if contraction_group_has_reset_expansion(group):
                 continue
             info = evaluate_vcp_group(df, group)
+            if info.get("post_group_support_break"):
+                reset_events.append(info["post_group_support_break"])
             if info["structure_valid"]:
                 decrease = contraction_decrease_status(group)
                 volume_pattern = volume_pattern_for_contractions(group, latest)
@@ -729,6 +792,10 @@ def select_current_vcp_group(df, contractions):
                 continue
             if best_invalid is None or info["structure_age_days"] < best_invalid["structure_age_days"]:
                 best_invalid = info
+
+    if candidates and reset_events:
+        for _, info in candidates:
+            info["rebuild_after_reset"] = True
 
     if candidates:
         candidates.sort(key=lambda item: item[0], reverse=True)
@@ -807,6 +874,7 @@ def detect_vcp_structure(df):
     post_structure_gain = current["post_structure_gain"] if current else None
     post_structure_drawdown = current["post_structure_drawdown"] if current else None
     post_breakout_state = current["post_breakout_state"] if current else "PRE_BREAKOUT"
+    rebuild_after_reset = bool(current and current.get("rebuild_after_reset"))
     breakout = current["breakout"] if current else None
     breakout_days = current["breakout_days"] if current else None
 
@@ -943,6 +1011,7 @@ def detect_vcp_structure(df):
         "post_structure_gain": post_structure_gain,
         "post_structure_drawdown": post_structure_drawdown,
         "post_breakout_state": post_breakout_state,
+        "rebuild_after_reset": rebuild_after_reset,
         "breakout": breakout,
         "breakout_days": breakout_days,
         "vcp_quality": quality_map.get(state, "D"),
@@ -1752,6 +1821,12 @@ def setup_position(setup_signal, setup_quality):
 def classify_result(structure, pullback, breakout, retest, score, overheat):
     internal_stage = structure.get("state")
     post_breakout_state = structure.get("post_breakout_state", "PRE_BREAKOUT")
+    if (
+        structure.get("rebuild_after_reset")
+        and internal_stage == "REJECT"
+        and post_breakout_state == "POST_BREAKOUT_RETEST"
+    ):
+        return "NONE", "NONE", "REJECT", CLASSIFICATION_CFG["no_position"]
     if retest.get("hit"):
         position = setup_position("RETEST_BUY", retest.get("setup_quality", "D"))
         return "VCP", "RETEST_BUY", "BUY_STANDARD", position
@@ -2250,6 +2325,8 @@ def process_codes(codes, today_yy, run_date, use_cache=True, allow_retry=True, p
         "api_calls": 0,
         "tdx_calls": 0,
     }
+    service = MarketDataService(MARKET_DATA_CONFIG)
+    frames, data_status = service.get_daily_bars(codes, run_date, max(200, BASE_CFG["min_runtime_data_days"]), force_refresh=not use_cache)
     fatal_stop = False
     retry_queue = []
 
@@ -2262,19 +2339,24 @@ def process_codes(codes, today_yy, run_date, use_cache=True, allow_retry=True, p
             continue
 
         print(f"[{i+1}/{len(codes)}] {code} {name} ...", end=" ", flush=True)
-        df, source = fetch_daily(code, name, today_yy, use_cache=use_cache, as_of_date=run_date)
+        df, source = frames.get(code), data_status.get(code, {"source": "missing", "error": "数据库未返回数据", "retryable": False})
         if df is None:
-            if allow_retry and "112" in str(source):
-                print(f"失败: {source}，加入重试队列")
+            if allow_retry and source["retryable"]:
+                print(f"失败: {source['error']}，加入重试队列")
                 retry_queue.append((code, name))
             else:
-                print(f"失败: {source}")
+                print(f"失败: {source['error']}")
                 stats["pull_fail"] += 1
-                if str(source).startswith("FATAL:"):
+                if str(source["error"]).startswith("FATAL:"):
                     fatal_stop = True
             continue
 
-        count_data_source(stats, source)
+        if source["source"] == "database":
+            stats["cache_hits"] += 1
+        elif source["source"] == "miaoxiang":
+            stats["api_calls"] += 1
+        else:
+            stats["tdx_calls"] += 1
         if len(df) < BASE_CFG["min_runtime_data_days"]:
             print(f"跳过: 数据不足({len(df)}天)")
             stats["data_insufficient"] += 1
@@ -2319,7 +2401,7 @@ def main():
     parser.add_argument("--json", action="store_true", help="同时将结构化结果打印到 stdout")
     parser.add_argument("--include-reject", action="store_true", help="CSV 中包含未纳入 model2_include 的标的")
     parser.add_argument("--no-cache", action="store_true", help="跳过缓存，重新拉取行情")
-    parser.add_argument("--refresh", action="store_true", help="清除今日缓存后重新拉取")
+    parser.add_argument("--refresh", action="store_true", help="强制刷新候选标的近期日线后重新计算")
     parser.add_argument("--with-llm", action="store_true", help="可选调用 LLM 对 top 标的做解释")
     parser.add_argument("--llm-top", type=int, default=10, help="LLM 解释 Top N，默认 10")
     parser.add_argument("--progress-file", help="进度文件路径（供 daily.py 流水线使用）")
@@ -2346,16 +2428,11 @@ def main():
     print("=" * 70)
     print("模型二：VCP 结构与触发信号精筛")
     print(f"模式: {mode} | 标的: {len(codes)} 只 | CSV: {quant_path}")
-    cleanup_cache = DailyCache()
-    print(f"缓存: {'关闭' if args.no_cache else '开启'} | 目录: {cleanup_cache.cache_dir}")
+    print("日线: 统一 SQLite 数据库（缺口自动主备源补数）")
     print("=" * 70)
 
-    cleaned = cleanup_cache.cleanup_old(keep_days=30)
-    if cleaned:
-        print(f"已清理 {cleaned} 个超过30天的旧缓存文件")
-    if args.refresh:
-        cleared = cleanup_cache.clear_today(today_yy)
-        print(f"已清除今日缓存 {cleared} 个文件")
+    if args.no_cache or args.refresh:
+        print("提示：强制从主备源刷新候选标的近期日线")
 
     results, stats = process_codes(codes, today_yy, run_date, use_cache=use_cache, progress_file=args.progress_file)
     csv_results = [r for r in results if should_write_to_quant(r, include_reject=args.include_reject)]

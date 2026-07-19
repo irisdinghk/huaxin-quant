@@ -25,8 +25,8 @@ Huaxin Quant 多模型流水线的股票花期发现与跟踪系统。每个筛�
 ### 每日一键流水线
 
 ```bash
-python3 scripts/daily.py &        # 后台启动全流程
-python3 scripts/monitor.py        # 前台查看进度 → tracker/花期策览_<date>.md
+python3 scripts/daily.py &        # 后台串行执行：数据更新 → Pool → Quant → Bloom → Signal Plan → 页面发布 → 打开面板 → 可选自选同步
+python3 scripts/monitor.py        # 前台查看进度 → .tmp/daily_progress_<date>.md
 ```
 
 详细说明见 `WORKFLOW.md`。
@@ -49,6 +49,18 @@ python3 scripts/run_pool.py --force-refresh  # 强制重拉
 python3 scripts/quant_filter.py                          # 全量
 python3 scripts/quant_filter.py --code 603444            # 单只
 python3 scripts/quant_filter.py --codes 300442,688676    # 多只
+```
+
+### 市场状态与板块热度（Market Regime）
+
+独立的市场环境旁路层：准备共享通达信行情，计算宽基趋势、全 A 广度、板块相对强度与阶段状态；不读取或改写 Pool、Quant、Bloom 结果。执行方式参考 `instructions/market-regime.md`。
+
+```bash
+python3 scripts/market_regime.py init --lookback 300  # 首次初始化
+python3 scripts/market_regime.py update               # 盘后增量更新
+python3 scripts/market_regime.py run                  # 生成市场报告与面板数据
+python3 scripts/market_regime.py run --no-llm         # 跳过 LLM 解读
+python3 scripts/market_regime.py status               # 检查数据就绪状态
 ```
 
 ### Bloom 信号层
