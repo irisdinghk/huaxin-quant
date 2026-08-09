@@ -140,10 +140,13 @@ Bloom 不重新计算模型二，但会使用模型二已输出或可直接读�
 | `structure_stage=VCP_FORMING` | `FORMING` |
 | `structure_stage=VCP_EARLY` | `EARLY` |
 | `structure_stage=POST_BREAKOUT` | `COOLDOWN` |
+| `post_breakout_state=POST_BREAKOUT_RETEST/HOT/CONSOLIDATING/FAILED/EXPIRED` 且未触发买点 | `COOLDOWN` |
 | `structure_stage=TREND_REBUILD` | `INVALID` |
 | `structure_valid=false` | `INVALID` |
 | `structure_stage=DATA_ISSUE` | `DATA_ISSUE` |
 | 已在 Bloom 状态表中的 `model2_include=false` / `action_hint=REJECT` | `COOLDOWN` 或 `EXIT` |
+
+状态判定优先级为：数据异常 → 已触发买点 → 明确结构失效 → 突破后生命周期 → 普通 VCP 阶段 → 未识别阶段兜底。模型二为保留旧 VCP 突破后审计，可能输出 `structure_stage=NONE`、`model2_include=true` 和明确的 `post_breakout_state`；Bloom 必须优先消费 `post_breakout_state`，不得把这类标的按未识别阶段兜底为 `FORMING`。
 
 风险阻断优先级高于普通观察状态。若结构状态为 `FORMING` / `MATURE` / `TRIGGERED`，但触发高风险规则，则输出 `RISK_BLOCKED`。
 
@@ -308,6 +311,10 @@ dashboard/data/<YYYYMM>/vcp_context_<YYMMDD>.js
 
 `dashboard_vcp.py` 仅读取当日 `bloom_input` 与同日模型二 JSON，按月发布 VCP 结构页所需的独立数据包；`--all` 可重建全部已有 Bloom 日期。它不得改写 Bloom 状态、模型二输出或触发交易动作。
 
+VCP 页面补充申万二级行业与板块状态时，优先读取同日 `market/stock_strength_<YYMMDD>.csv` 和 `market/sector_heat_<YYMMDD>.csv`；同日文件缺失时才读取数据库中的同日快照。不得回退到其他日期。历史降级口径沿用 Market Regime 产物的 `history_basis`，不得把当前成分回填伪装成严格点时数据。
+
+VCP Dashboard 的历史起点与系统回放起点一致，为 `2026-05-06`。若历史 Quant 已存在但缺少早期 `bloom_input`，只允许按日期顺序做确定性轻量回放：生命周期状态必须写入临时隔离目录，跳过 LLM、事件账本和当前 `bloom_state.csv`，仅补充缺失的历史 `bloom_input` 后再由 `dashboard_vcp.py --all` 发布。不得为修复页面重复运行市场、Pool 或 Quant，也不得用当前 Bloom 状态倒灌历史日期。
+
 `bloom_state_before_<YYYYMMDD>.csv` 是当日首次写入前的状态快照，用于同日重复运行时保持 `consecutive_reject`、`days_tracked` 等生命周期字段的判断基准稳定。重复运行同一天时必须优先读取该快照，避免已写入的当日 state 覆盖昨日累计状态，导致 `EXIT` 判断被冲掉。
 
 报告分区：
@@ -355,6 +362,7 @@ LLM 观察要点：
 - 全新的 `model2_include=false` 标的不能写入 Bloom 状态表；已在状态表中的标的可因连续冷却或失效进入 `EXIT`。
 - `EXIT` 标的必须从滚动状态表移除，后续只能由模型二重新发现并以新生命周期进入。
 - 高结构分但高风险的股票应输出 `RISK_BLOCKED`，而不是 `TRIGGERED` 的正向交易结论。
+- `structure_stage=NONE` 且存在明确 `POST_BREAKOUT_*` 生命周期的标的必须进入 `COOLDOWN`，不得出现在活跃 VCP 结构列表。
 - `valuation_candidate` 只代表送估值候选，不代表估值结论或交易建议。
 - LLM 观察要点不得静默失败；每日 summary 和 Markdown 必须能看出 LLM 是成功、部分成功、跳过还是失败。
 - 配置了 LLM 且调用失败时，Bloom 命令不得以成功状态退出。
