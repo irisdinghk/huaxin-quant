@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Daily pipeline: 数据更新 → Pool → Quant → Bloom → Signal Plan → 信号财务提示 → 页面发布 → 打开面板 → 东方财富自选同步。
+Daily pipeline: 数据更新 → Pool → Quant → Bloom → Signal Plan → 信号财务提示
+→ 完整资金观测 → 页面发布（含信号股资金补查）→ 打开面板 → 东方财富自选同步。
 
 Launches each stage via subprocess, writes step-level progress to a shared
 JSON file consumed by monitor.py. This script is non-interactive and designed
@@ -71,11 +72,26 @@ def _progress_path(date_yy):
 
 # ── stage runners ──
 
+def run_command_with_retries(command, *, attempts=2, label="步骤"):
+    """仅用于可重入步骤的有限重试。
+
+    Pool / Quant / Bloom / Signal Plan 会维护跨日状态，不得调用此函数盲目重试。
+    """
+    result = None
+    for attempt in range(1, attempts + 1):
+        result = subprocess.run(command, cwd=PROJECT_ROOT)
+        if result.returncode == 0:
+            return result
+        if attempt < attempts:
+            print(f"[daily] ⚠ {label}失败 (exit {result.returncode})，将重试 {attempts - attempt} 次")
+    return result
+
+
 def run_market_update(date_yy):
     iso = datetime.strptime(date_yy, "%y%m%d").strftime("%Y-%m-%d")
-    return subprocess.run(
+    return run_command_with_retries(
         ["python3", "scripts/market_regime.py", "update", "--date", iso],
-        cwd=PROJECT_ROOT,
+        label="市场数据更新",
     )
 
 
@@ -121,16 +137,84 @@ def run_signal_fundamentals(date_yy):
     )
 
 
-def run_dashboard_publish(date_yy):
+def run_capital_observer(date_yy):
     iso = datetime.strptime(date_yy, "%y%m%d").strftime("%Y-%m-%d")
+    return run_command_with_retries(
+        ["python3", "scripts/capital_observer.py", "run", "--date", iso, "--fetch"],
+        label="资金观测",
+    )
+
+
+def load_capital_observer_meta(date_yy):
+    path = Path(PROJECT_ROOT) / "capital" / f"capital_observer_{date_yy}.json"
+    if not path.exists():
+        raise FileNotFoundError(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    meta = payload.get("meta") or {}
+    expected_date = datetime.strptime(date_yy, "%y%m%d").strftime("%Y-%m-%d")
+    if meta.get("trade_date") != expected_date:
+        raise ValueError(f"资金观测日期不一致: {meta.get('trade_date')} != {expected_date}")
+    if meta.get("fetch_enabled") is not True:
+        raise ValueError("当日完整资金观测未启用资金补取")
+    return meta
+
+
+def load_market_llm_meta(date_yy):
+    """读取市场报告并确认当日 LLM 解读真正成功。"""
+    path = Path(PROJECT_ROOT) / "market" / f"market_regime_{date_yy}.json"
+    if not path.exists():
+        raise FileNotFoundError(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    expected_date = datetime.strptime(date_yy, "%y%m%d").strftime("%Y-%m-%d")
+    meta = payload.get("meta") or {}
+    if meta.get("run_date") != expected_date:
+        raise ValueError(f"市场报告日期不一致: {meta.get('run_date')} != {expected_date}")
+    llm = payload.get("llm") or {}
+    if llm.get("status") != "success":
+        reason = llm.get("reason") or "unknown"
+        raise ValueError(f"市场 LLM 解读未成功: {llm.get('status')} ({reason})")
+    if not str(llm.get("analysis") or "").strip():
+        raise ValueError("市场 LLM 解读为空")
+    return llm
+
+
+def run_market_publish(date_yy):
+    """发布市场面板；LLM 失败时保留主线结论并定向重试一次。"""
+    iso = datetime.strptime(date_yy, "%y%m%d").strftime("%Y-%m-%d")
+    command = ["python3", "scripts/market_regime.py", "run", "--date", iso]
+    result = subprocess.run(command, cwd=PROJECT_ROOT)
+    if result.returncode == 0:
+        try:
+            load_market_llm_meta(date_yy)
+            return result
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[daily] ⚠ {exc}，将保留已生成主线并重试 LLM")
+    else:
+        print(f"[daily] ⚠ 市场面板失败 (exit {result.returncode})，将保留已有主线并重试")
+
+    retry_command = command + ["--reuse-existing-mainline"]
+    result = subprocess.run(retry_command, cwd=PROJECT_ROOT)
+    if result.returncode != 0:
+        return result
+    try:
+        load_market_llm_meta(date_yy)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"[daily] ✗ {exc}")
+        return subprocess.CompletedProcess(retry_command, 4)
+    return result
+
+
+def run_dashboard_publish(date_yy):
+    result = run_market_publish(date_yy)
+    if result.returncode != 0:
+        return result
     commands = [
-        ["python3", "scripts/market_regime.py", "run", "--date", iso],
         ["python3", "scripts/backtest.py", "--date", date_yy],
         ["python3", "scripts/dashboard_vcp.py", "--date", date_yy],
         ["python3", "scripts/dashboard_signals.py", "--date", date_yy, "--fetch-capital", "--max-mx-requests", "5"],
     ]
     for command in commands:
-        result = subprocess.run(command, cwd=PROJECT_ROOT)
+        result = run_command_with_retries(command, label=f"页面发布 {command[1]}")
         if result.returncode != 0:
             return result
     return result
@@ -145,7 +229,10 @@ def verify_pipeline_outputs(date_yy):
         root / "cache" / "quant_runs" / f"quant_{date_yy}.json",
         root / "bloom" / "state" / f"bloom_input_{date_yy}.json",
         root / "signal_plan" / f"signal_plan_{date_yy}.json",
+        root / "capital" / f"capital_observer_{date_yy}.json",
+        root / "market" / f"market_regime_{date_yy}.json",
         root / "market" / "data" / f"market_context_{date_yy}.json",
+        month_dir / f"capital_context_{date_yy}.js",
         month_dir / f"market_context_{date_yy}.js",
         month_dir / f"vcp_context_{date_yy}.js",
         month_dir / f"signals_context_{date_yy}.js",
@@ -161,13 +248,62 @@ def verify_pipeline_outputs(date_yy):
             missing.append("dashboard/data/index.js（格式无效）")
         else:
             index = json.loads(match.group(1))
-            for module in ("market", "vcp", "signals", "backtest"):
+            for module in ("capital", "market", "vcp", "signals", "backtest"):
                 if date_yy not in index.get(module, {}).get("available", []):
                     missing.append(f"dashboard index {module}:{date_yy}")
+
+    capital_path = root / "capital" / f"capital_observer_{date_yy}.json"
+    if capital_path.exists():
+        try:
+            meta = (json.loads(capital_path.read_text(encoding="utf-8")).get("meta") or {})
+            expected_date = datetime.strptime(date_yy, "%y%m%d").strftime("%Y-%m-%d")
+            if meta.get("trade_date") != expected_date:
+                missing.append(f"capital observer 日期:{meta.get('trade_date')}")
+            if meta.get("fetch_enabled") is not True:
+                missing.append("capital observer 未启用资金补取")
+        except (OSError, json.JSONDecodeError):
+            missing.append(f"capital/capital_observer_{date_yy}.json（格式无效）")
+
+    market_report_path = root / "market" / f"market_regime_{date_yy}.json"
+    if market_report_path.exists():
+        try:
+            load_market_llm_meta(date_yy)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            missing.append(str(exc))
+
+    market_context_path = root / "market" / "data" / f"market_context_{date_yy}.json"
+    if market_context_path.exists():
+        try:
+            context = json.loads(market_context_path.read_text(encoding="utf-8"))
+            market_state = context.get("market_state") or {}
+            if market_state.get("analysis_source") != "llm":
+                missing.append(f"market context 解读来源:{market_state.get('analysis_source')}")
+            if not str(market_state.get("analysis") or "").strip():
+                missing.append("market context 市场解读为空")
+        except (OSError, json.JSONDecodeError):
+            missing.append(f"market/data/market_context_{date_yy}.json（格式无效）")
+
+    signals_path = month_dir / f"signals_context_{date_yy}.js"
+    if signals_path.exists():
+        try:
+            assignment = re.search(
+                rf"\[{re.escape(json.dumps(date_yy))}\]\s*=\s*(\{{.*\}});\s*$",
+                signals_path.read_text(encoding="utf-8"),
+                re.S,
+            )
+            if not assignment:
+                raise ValueError("assignment missing")
+            signals = json.loads(assignment.group(1))
+            if (signals.get("meta") or {}).get("capital_fetch_enabled") is not True:
+                missing.append("signals context 未启用信号股资金补查")
+            if any("capital_support" not in row for row in signals.get("signals", [])):
+                missing.append("signals context 存在缺少 capital_support 的信号")
+        except (OSError, ValueError, json.JSONDecodeError):
+            missing.append(f"dashboard signals:{date_yy}（格式无效）")
     if missing:
         print("[daily] 页面/产物完整性核验失败：" + "；".join(missing))
         return False
-    print(f"[daily] [OK] 完整性核验通过：{date_yy} 四类日期页面数据均已发布")
+    print(f"[daily] [OK] 完整性核验通过：{date_yy} 资金/市场/VCP/信号/回测日期数据均已发布")
     return True
 
 
@@ -180,9 +316,9 @@ def open_dashboard():
 
 def run_zixuan(date_yy):
     """Rebuild Eastmoney's all-watchlist after Bloom has completed."""
-    return subprocess.run(
+    return run_command_with_retries(
         ["python3", "scripts/sync_zixuan.py", "--date", date_yy, "--yes"],
-        cwd=PROJECT_ROOT,
+        label="东方财富自选同步",
     )
 
 
@@ -229,7 +365,7 @@ def main():
 
     progress_path = _progress_path(date_yy)
     tracker = ProgressTracker(progress_path)
-    tracker.init(["data_update", "pool", "quant", "bloom", "signal_plan", "signal_fundamentals", "dashboard", "verify", "open_dashboard", "zixuan"])
+    tracker.init(["data_update", "pool", "quant", "bloom", "signal_plan", "signal_fundamentals", "capital_observer", "dashboard", "verify", "open_dashboard", "zixuan"])
     tracker.set_date(date_yy)
 
     print(f"[daily] 流水线启动 {date_yy}")
@@ -239,7 +375,7 @@ def main():
     errors = []
 
     def stop_after(stage):
-        tracker.mark_done()
+        tracker.mark_failed(errors[-1] if errors else f"{stage} 失败")
         print(f"[daily] {stage} 失败，流水线中止。共 {len(errors)} 个错误")
         sys.exit(1)
 
@@ -319,9 +455,36 @@ def main():
         tracker.step_done("signal_fundamentals")
         print("[daily] [OK] signal fundamentals done")
 
-    # ── Step 7: Dashboard packages ──
+    # ── Step 7: Full daily capital observation ──
+    tracker.step_start("capital_observer")
+    print("[daily] → 当天完整资金观测")
+    result = run_capital_observer(date_yy)
+    if result.returncode != 0:
+        errors.append(f"capital_observer: exit {result.returncode}")
+        tracker.step_done("capital_observer", error=f"exit {result.returncode}")
+        stop_after("资金观测")
+    try:
+        capital_meta = load_capital_observer_meta(date_yy)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        errors.append(f"capital_observer: {exc}")
+        tracker.step_done("capital_observer", error=str(exc))
+        stop_after("资金观测")
+    tracker.step_update(
+        "capital_observer",
+        observer_status=capital_meta.get("status"),
+        requests_used=capital_meta.get("requests_used"),
+        request_budget=capital_meta.get("request_budget"),
+        error_count=len(capital_meta.get("errors") or []),
+    )
+    tracker.step_done("capital_observer")
+    if capital_meta.get("status") == "partial":
+        print("[daily] ⚠ 资金观测部分完成，已保留当日产物与错误明细")
+    else:
+        print("[daily] ✓ capital observer done")
+
+    # ── Step 8: Dashboard packages, including signal-stock capital fetch ──
     tracker.step_start("dashboard")
-    print("[daily] → 生成数据分析面板")
+    print("[daily] → 生成数据分析面板（含信号股资金补查）")
     result = run_dashboard_publish(date_yy)
     if result.returncode != 0:
         errors.append(f"dashboard: exit {result.returncode}")
@@ -330,7 +493,7 @@ def main():
     tracker.step_done("dashboard")
     print("[daily] [OK] dashboard done")
 
-    # ── Step 8: Verify all date-scoped outputs ──
+    # ── Step 9: Verify all date-scoped outputs ──
     tracker.step_start("verify")
     if not verify_pipeline_outputs(date_yy):
         errors.append("verify: missing date-scoped output")
@@ -338,7 +501,7 @@ def main():
         stop_after("完整性核验")
     tracker.step_done("verify")
 
-    # ── Step 9: Open dashboard ──
+    # ── Step 10: Open dashboard ──
     tracker.step_start("open_dashboard")
     print("[daily] → 打开数据分析面板")
     result = open_dashboard()
@@ -349,7 +512,7 @@ def main():
         tracker.step_done("open_dashboard")
         print("[daily] [OK] dashboard opened")
 
-    # ── Step 10: Eastmoney all-watchlist rebuild ──
+    # ── Step 11: Eastmoney all-watchlist rebuild ──
     if not _env_flag("ENABLE_ZIXUAN_SYNC"):
         tracker.step_done("zixuan")
         print("[daily] - zixuan disabled (set ENABLE_ZIXUAN_SYNC=true in .env to enable)")
@@ -364,12 +527,14 @@ def main():
             tracker.step_done("zixuan")
             print(f"[daily] [OK] zixuan done")
 
-    tracker.mark_done()
-    print(f"[daily] 流水线完成，共 {len(errors)} 个错误")
     if errors:
+        tracker.mark_failed(errors[-1])
+        print(f"[daily] 流水线中止，共 {len(errors)} 个错误")
         for e in errors:
             print(f"  [WARN] {e}")
         sys.exit(1)
+    tracker.mark_done()
+    print("[daily] 流水线完成，共 0 个错误")
 
 
 if __name__ == "__main__":

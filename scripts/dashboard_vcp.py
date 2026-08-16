@@ -14,13 +14,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(os.path.abspath(__file__)).parents[1]))
 from scripts.shared import PROJECT_ROOT
+from scripts.plan_realization import realized_events_for_date
 
 
 ROOT = Path(PROJECT_ROOT)
 BLOOM_INPUT_DIR = ROOT / "bloom" / "state"
 QUANT_RUN_DIR = ROOT / "cache" / "quant_runs"
+POOL_DIR = ROOT / "pool"
 MARKET_DATA_DB = ROOT / "cache" / "market_data" / "market_data.sqlite"
 MARKET_REGIME_DB = ROOT / "cache" / "market_regime" / "market_regime.sqlite"
+SIGNAL_PLAN_DIR = ROOT / "signal_plan"
 MARKET_OUTPUT_DIR = ROOT / "market"
 DASHBOARD_DATA_DIR = ROOT / "dashboard" / "data"
 DASHBOARD_START_DATE = "260506"
@@ -30,6 +33,11 @@ VOLUME_PATTERN_LABELS = {
     "flat": "量能基本持平",
     "mixed": "量能未呈持续缩减",
     "failed": "量能未达到缩量要求",
+}
+SOURCE_LABELS = {
+    "CORE_QUALITY": ("核心质量池", "core"),
+    "EXPANSION_RS": ("RS扩展池", "expansion"),
+    "BOTH": ("双通道", "both"),
 }
 
 
@@ -51,6 +59,27 @@ def latest_date() -> str:
 
 def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_pool_sources(date_yy: str) -> dict[str, dict]:
+    """Load same-day Pool provenance without falling back to another date."""
+    path = POOL_DIR / f"pool_{date_yy}.csv"
+    if not path.exists():
+        return {}
+    result = {}
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            match = re.search(r"\d{6}", str(row.get("股票代码") or ""))
+            if not match:
+                continue
+            channel = str(row.get("pool_channel") or "").strip()
+            label, tone = SOURCE_LABELS.get(channel, ("来源待确认", "unknown"))
+            result[match.group(0)] = {
+                "pool_channel": channel or "UNKNOWN",
+                "source_label": label,
+                "source_tone": tone,
+            }
+    return result
 
 
 def write_dashboard_index() -> None:
@@ -126,7 +155,10 @@ def load_industry_context(codes: list[str], run_date: str) -> dict[str, dict]:
         state_conn = sqlite3.connect(f"file:{MARKET_REGIME_DB}?mode=ro", uri=True)
         state_conn.row_factory = sqlite3.Row
         sector_rows = state_conn.execute(
-            """SELECT block_name, sector_state, rank_20, relative_strength_20
+            """SELECT block_name, sector_state, sector_phase, sector_health, sector_health_level,
+                       sector_health_score, short_pulse,
+                       sector_policy_tier, data_status, rank_20, rank_pct_20, relative_strength_20,
+                       advance_ratio AS up_breadth, advance_ratio_5 AS up_breadth_5
                  FROM sector_daily_metrics
                  WHERE trade_date=? AND block_kind='industry_sw_l2'""",
             (run_date,),
@@ -196,13 +228,39 @@ def build_context(date_yy: str) -> dict:
     quant_results = load_json(quant_path).get("results", []) if quant_path.exists() else []
     quant_by_code = {str(row.get("code", "")).zfill(6): row for row in quant_results}
     active = bloom.get("sections", {}).get("active", [])
-    industry_by_code = load_industry_context([str(row.get("code", "")).zfill(6) for row in active], bloom.get("summary", {}).get("date", ""))
-    candidates = [compact_candidate(row, quant_by_code.get(str(row.get("code", "")).zfill(6), {}), industry_by_code.get(str(row.get("code", "")).zfill(6), {})) for row in active]
-    candidates.sort(key=lambda row: (row["bloom_status"] != "TRIGGERED", row["bloom_status"] != "MATURE", -float(row["structure_score"] or 0)))
+    realized = realized_events_for_date(date_yy, SIGNAL_PLAN_DIR, QUANT_RUN_DIR, MARKET_DATA_DB)
+    realized_by_key = {
+        (str(event.get("code", "")).zfill(6), event.get("setup_type")): event
+        for event in realized
+    }
+    bloom_by_code = {str(row.get("code", "")).zfill(6): row for row in active}
+    codes = [str(row.get("code", "")).zfill(6) for row in active]
+    industry_by_code = load_industry_context(codes, bloom.get("summary", {}).get("date", ""))
+    pool_sources = load_pool_sources(date_yy)
+    candidates = []
+    for code in codes:
+        bloom_row = bloom_by_code.get(code, {})
+        candidate = compact_candidate(bloom_row, quant_by_code.get(code, {}), industry_by_code.get(code, {}))
+        candidate.update(pool_sources.get(code, {
+            "pool_channel": "UNKNOWN", "source_label": "来源待确认", "source_tone": "unknown",
+        }))
+        event = realized_by_key.get((code, candidate.get("model2_setup_signal")))
+        candidate["previous_plan_hit"] = bool(event)
+        candidate["previous_plan_source_date"] = event.get("plan_date") if event else None
+        candidates.append(candidate)
+    candidates.sort(key=lambda row: (row.get("bloom_status") != "TRIGGERED", row.get("bloom_status") != "MATURE", -float(row["structure_score"] or 0)))
+    summary = dict(bloom.get("summary", {}))
+    summary["source_status_dist"] = summary.get("status_dist", {})
+    summary["status_dist"] = {
+        status: sum(row.get("bloom_status") == status for row in candidates)
+        for status in ("TRIGGERED", "MATURE", "FORMING", "EARLY", "RISK_BLOCKED", "COOLDOWN")
+    }
+    summary["plan_hit_total"] = sum(row.get("previous_plan_hit", False) for row in candidates)
+    summary["display_total"] = len(candidates)
     return {
         "meta": {"run_date": bloom.get("summary", {}).get("date"), "source": bloom_path.name,
                  "quant_source": quant_path.name if quant_path.exists() else None},
-        "summary": bloom.get("summary", {}),
+        "summary": summary,
         "candidates": candidates,
     }
 
