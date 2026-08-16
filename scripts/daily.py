@@ -167,14 +167,15 @@ def verify_pipeline_outputs(date_yy):
     if missing:
         print("[daily] 页面/产物完整性核验失败：" + "；".join(missing))
         return False
-    print(f"[daily] ✓ 完整性核验通过：{date_yy} 四类日期页面数据均已发布")
+    print(f"[daily] [OK] 完整性核验通过：{date_yy} 四类日期页面数据均已发布")
     return True
 
 
 def open_dashboard():
     """Open the local dashboard in the system default browser after publishing."""
+    import webbrowser
     dashboard = Path(PROJECT_ROOT) / "dashboard" / "index.html"
-    return subprocess.run(["open", str(dashboard)], cwd=PROJECT_ROOT)
+    return webbrowser.open(f"file://{dashboard}")
 
 
 def run_zixuan(date_yy):
@@ -251,7 +252,7 @@ def main():
         tracker.step_done("data_update", error=f"exit {result.returncode}")
         stop_after("数据更新")
     tracker.step_done("data_update")
-    print("[daily] ✓ data update done")
+    print("[daily] [OK] data update done")
 
     # ── Step 2: Pool ──
     if not args.skip_pool:
@@ -264,7 +265,7 @@ def main():
             stop_after("Pool")
         else:
             tracker.step_done("pool")
-            print(f"[daily] ✓ pool done")
+            print(f"[daily] [OK] pool done")
     else:
         tracker.step_done("pool")  # mark as done since we're skipping
 
@@ -277,7 +278,7 @@ def main():
         tracker.step_done("quant", error=f"exit {result.returncode}")
     else:
         tracker.step_done("quant")
-        print(f"[daily] ✓ quant done")
+        print(f"[daily] [OK] quant done")
 
     if any("quant" in e for e in errors):
         stop_after("Quant")
@@ -292,9 +293,9 @@ def main():
         stop_after("Bloom")
     tracker.step_done("bloom")
     if result.returncode == 3:
-        print("[daily] ⚠ Bloom LLM 解读失败，已使用规则产物继续")
+        print("[daily] [WARN] Bloom LLM 解读失败，已使用规则产物继续")
     else:
-        print("[daily] ✓ bloom done")
+        print("[daily] [OK] bloom done")
 
     # ── Step 5: Signal Plan ──
     tracker.step_start("signal_plan")
@@ -305,7 +306,7 @@ def main():
         tracker.step_done("signal_plan", error=f"exit {result.returncode}")
         stop_after("Signal Plan")
     tracker.step_done("signal_plan")
-    print("[daily] ✓ signal plan done")
+    print("[daily] [OK] signal plan done")
 
     # ── Step 6: Signal financial hints (non-blocking sidecar) ──
     tracker.step_start("signal_fundamentals")
@@ -316,7 +317,7 @@ def main():
         print("[daily] ⚠ 信号财务补查失败，页面将使用已有缓存或降级提示")
     else:
         tracker.step_done("signal_fundamentals")
-        print("[daily] ✓ signal fundamentals done")
+        print("[daily] [OK] signal fundamentals done")
 
     # ── Step 7: Dashboard packages ──
     tracker.step_start("dashboard")
@@ -327,7 +328,7 @@ def main():
         tracker.step_done("dashboard", error=f"exit {result.returncode}")
         stop_after("页面发布")
     tracker.step_done("dashboard")
-    print("[daily] ✓ dashboard done")
+    print("[daily] [OK] dashboard done")
 
     # ── Step 8: Verify all date-scoped outputs ──
     tracker.step_start("verify")
@@ -341,12 +342,12 @@ def main():
     tracker.step_start("open_dashboard")
     print("[daily] → 打开数据分析面板")
     result = open_dashboard()
-    if result.returncode != 0:
-        tracker.step_done("open_dashboard", error=f"exit {result.returncode}")
-        print("[daily] ⚠ 无法自动打开浏览器，页面数据已生成")
+    if not result:
+        tracker.step_done("open_dashboard", error="browser open failed")
+        print("[daily] [WARN] 无法自动打开浏览器，页面数据已生成")
     else:
         tracker.step_done("open_dashboard")
-        print("[daily] ✓ dashboard opened")
+        print("[daily] [OK] dashboard opened")
 
     # ── Step 10: Eastmoney all-watchlist rebuild ──
     if not _env_flag("ENABLE_ZIXUAN_SYNC"):
@@ -361,13 +362,13 @@ def main():
             tracker.step_done("zixuan", error=f"exit {result.returncode}")
         else:
             tracker.step_done("zixuan")
-            print(f"[daily] ✓ zixuan done")
+            print(f"[daily] [OK] zixuan done")
 
     tracker.mark_done()
     print(f"[daily] 流水线完成，共 {len(errors)} 个错误")
     if errors:
         for e in errors:
-            print(f"  ⚠️ {e}")
+            print(f"  [WARN] {e}")
         sys.exit(1)
 
 

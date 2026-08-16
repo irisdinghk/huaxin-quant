@@ -114,7 +114,7 @@ def fetch_segments(args: argparse.Namespace) -> list[Path]:
         print(f"  分段 {segment.name}: rows={rows} total={total}")
         threshold = RUNTIME_CFG["truncation_threshold"]
         if total >= threshold or rows >= threshold:
-            print(f"  ⚠️ {segment.name} 可能触发 {threshold} 条截断，追加 PE 正序/倒序拆分")
+            print(f"  [WARN] {segment.name} 可能触发 {threshold} 条截断，追加 PE 正序/倒序拆分")
             for sort_clause in RUNTIME_CFG["split_sort_clauses"]:
                 split_query = build_query(segment.condition, sort_clause)
                 split_path = fetch_query(split_query, xuangu_script, args.cache_days, args.force_refresh, args.dry_run)
@@ -123,7 +123,7 @@ def fetch_segments(args: argparse.Namespace) -> list[Path]:
                 split_rows, split_total = result_stats(split_path) if split_path else (0, 0)
                 print(f"    {sort_clause}: rows={split_rows} total={split_total}")
                 if split_total >= threshold and split_rows >= threshold:
-                    print(f"    ⚠️ {sort_clause} 仍可能截断，建议后续再加市值/估值子分段")
+                    print(f"    [WARN] {sort_clause} 仍可能截断，建议后续再加市值/估值子分段")
 
         time.sleep(args.delay)
 

@@ -168,7 +168,7 @@ for filename, rows, total in segment_counts:
     print(f"  {filename[-40:]}: {rows} rows / {total} total {age_tag}")
 
 if stale_files:
-    print(f"\n  ⚠️ 跳过 {len(stale_files)} 个过期缓存（>{CACHE_MAX_AGE_DAYS}天）:")
+    print(f"\n  [WARN] 跳过 {len(stale_files)} 个过期缓存（>{CACHE_MAX_AGE_DAYS}天）:")
     for f, age in stale_files:
         print(f"    - {f[-50:]} ({age}天前)")
     print(f"  如需刷新，删除 cache/xuangu/ 中旧文件后重新拉取")
@@ -198,20 +198,20 @@ def resolve_ocf_np_keys(sample, annual_period):
     ocf_annual = find_key(sample, "NETOPERATECASHFLOW", annual_period)
 
     if np_annual and ocf_annual:
-        print(f"  ✅ OCF+NP 统一年报({annual_period})")
+        print(f"  [OK] OCF+NP 统一年报({annual_period})")
         return np_annual, ocf_annual
 
     # 统一降级到 #LATEST#（精确匹配后缀，避免 NP 取到 2025-09-30 而 OCF 取到 2026Q1）
     np_latest = find_key(sample, "PARENTNETPROFIT", "#LATEST#")
     ocf_latest = find_key(sample, "NETOPERATECASHFLOW", "#LATEST#")
     if np_latest and ocf_latest:
-        print(f"  ⚠️ OCF+NP 统一降级#LATEST#（年报不全: NP={'✅' if np_annual else '❌'} OCF={'✅' if ocf_annual else '❌'}）")
+        print(f"  [WARN] OCF+NP 统一降级#LATEST#（年报不全: NP={'YES' if np_annual else 'NO'} OCF={'YES' if ocf_annual else 'NO'}）")
         return np_latest, ocf_latest
 
     # 各自尽力
     np_key = np_annual or np_latest or find_key(sample, "PARENTNETPROFIT")
     ocf_key = ocf_annual or ocf_latest or find_key(sample, "NETOPERATECASHFLOW")
-    print(f"  ⚠️ OCF+NP 尽力模式: NP={'annual' if np_annual else 'latest' if np_latest else 'fallback'} OCF={'annual' if ocf_annual else 'latest' if ocf_latest else 'fallback'}")
+    print(f"  [WARN] OCF+NP 尽力模式: NP={'annual' if np_annual else 'latest' if np_latest else 'fallback'} OCF={'annual' if ocf_annual else 'latest' if ocf_latest else 'fallback'}")
     return np_key, ocf_key
 
 KEY_NP, KEY_OCF = resolve_ocf_np_keys(sample, ANNUAL_PERIOD)
@@ -220,19 +220,19 @@ KEY_NP, KEY_OCF = resolve_ocf_np_keys(sample, ANNUAL_PERIOD)
 _sample_np_raw = str(sample.get(KEY_NP, "")) if KEY_NP else ""
 _detected_period = detect_period(_sample_np_raw)
 _ocf_threshold = OCF_NP_THRESHOLD.get(_detected_period, OCF_NP_THRESHOLD["unknown"])
-print(f"  📐 周期={_detected_period} | OCF/NP阈值={_ocf_threshold} | NP阈值={NP_MIN_BY_PERIOD.get(_detected_period, NP_MIN_ANNUAL)/1e4:.0f}万")
+print(f"  [INFO] 周期={_detected_period} | OCF/NP阈值={_ocf_threshold} | NP阈值={NP_MIN_BY_PERIOD.get(_detected_period, NP_MIN_ANNUAL)/1e4:.0f}万")
 
 def find_key_annual_fallback(sample, metric, period, label):
     """Try period match first, fall back to metric-only if only LATEST available."""
     key = find_key(sample, metric, period)
     if key:
-        print(f"  ✅ {label}({period}): {key}")
+        print(f"  [OK] {label}({period}): {key}")
         return key
     key = find_key(sample, metric)
     if key:
-        print(f"  ⚠️ {label}(降级LATEST): {key}")
+        print(f"  [WARN] {label}(降级LATEST): {key}")
         return key
-    print(f"  ❌ {label}: None")
+    print(f"  [ERR] {label}: None")
     return None
 
 KEY_DEBT = find_key(sample, "ZCFZL")
@@ -287,10 +287,10 @@ key_map = {
     "每股收益": KEY_EPS,
 }
 for name, k in key_map.items():
-    print(f"  {'✅' if k else '❌'} {name}: {k}")
+    print(f"  {'[OK]' if k else '[ERR]'} {name}: {k}")
 
 if not KEY_MCAP:
-    print("  ❌ 缺少总市值字段，无法执行 50 亿市值硬门槛")
+    print("  [ERR] 缺少总市值字段，无法执行 50 亿市值硬门槛")
     exit(1)
 
 # Apply filters
@@ -606,10 +606,10 @@ if risk_counter:
 truncation_threshold = RUNTIME_CFG["truncation_threshold"]
 truncated = [s for s in segment_counts if s[1] >= truncation_threshold]
 if truncated:
-    print(f"\n  ⚠️ 截断警告：以下分段实际返回 >= {truncation_threshold}，可能覆盖不全:")
+    print(f"\n  [WARN] 截断警告：以下分段实际返回 >= {truncation_threshold}，可能覆盖不全:")
     for name, rows, total in truncated:
         print(f"    {name}: {rows}/{total}")
 
 print(f"\n{'='*60}")
-print(f"✅ 完成: {csv_path}")
+print(f"[OK] 完成: {csv_path}")
 print(f"{'='*60}")

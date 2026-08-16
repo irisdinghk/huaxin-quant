@@ -82,10 +82,10 @@ def _read_progress(date_yy):
 
 def _status_icon(status):
     icons = {
-        "waiting": "⏳",
-        "running": "🔄",
-        "done": "✅",
-        "error": "❌",
+        "waiting": "[...]",
+        "running": "[>>]",
+        "done": "[OK]",
+        "error": "[ERR]",
     }
     return icons.get(status, "❓")
 
@@ -235,7 +235,7 @@ def main():
                 )
                 total = _step_time({"status": "done", "started_at": progress.get("started_at"),
                                     "elapsed_s": progress.get("total_elapsed_s")})
-                print(f"[monitor] ✅ 流水线完成 — 总耗时 {total}，{error_count} 个错误")
+                print(f"[monitor] [OK] 流水线完成 — 总耗时 {total}，{error_count} 个错误")
                 print(f"[monitor] 进度记录: {progress_path}")
                 if error_count:
                     sys.exit(1)
