@@ -83,7 +83,7 @@ def run_command_with_retries(command, *, attempts=2, label="步骤"):
         if result.returncode == 0:
             return result
         if attempt < attempts:
-            print(f"[daily] ⚠ {label}失败 (exit {result.returncode})，将重试 {attempts - attempt} 次")
+            print(f"[daily] [WARN] {label}失败 (exit {result.returncode})，将重试 {attempts - attempt} 次")
     return result
 
 
@@ -188,9 +188,9 @@ def run_market_publish(date_yy):
             load_market_llm_meta(date_yy)
             return result
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            print(f"[daily] ⚠ {exc}，将保留已生成主线并重试 LLM")
+            print(f"[daily] [WARN] {exc}，将保留已生成主线并重试 LLM")
     else:
-        print(f"[daily] ⚠ 市场面板失败 (exit {result.returncode})，将保留已有主线并重试")
+        print(f"[daily] [WARN] 市场面板失败 (exit {result.returncode})，将保留已有主线并重试")
 
     retry_command = command + ["--reuse-existing-mainline"]
     result = subprocess.run(retry_command, cwd=PROJECT_ROOT)
@@ -199,7 +199,7 @@ def run_market_publish(date_yy):
     try:
         load_market_llm_meta(date_yy)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"[daily] ✗ {exc}")
+        print(f"[daily] [ERR] {exc}")
         return subprocess.CompletedProcess(retry_command, 4)
     return result
 
@@ -450,7 +450,7 @@ def main():
     result = run_signal_fundamentals(date_yy)
     if result.returncode != 0:
         tracker.step_done("signal_fundamentals", error=f"exit {result.returncode}")
-        print("[daily] ⚠ 信号财务补查失败，页面将使用已有缓存或降级提示")
+        print("[daily] [WARN] 信号财务补查失败，页面将使用已有缓存或降级提示")
     else:
         tracker.step_done("signal_fundamentals")
         print("[daily] [OK] signal fundamentals done")
@@ -478,9 +478,9 @@ def main():
     )
     tracker.step_done("capital_observer")
     if capital_meta.get("status") == "partial":
-        print("[daily] ⚠ 资金观测部分完成，已保留当日产物与错误明细")
+        print("[daily] [WARN] 资金观测部分完成，已保留当日产物与错误明细")
     else:
-        print("[daily] ✓ capital observer done")
+        print("[daily] [OK] capital observer done")
 
     # ── Step 8: Dashboard packages, including signal-stock capital fetch ──
     tracker.step_start("dashboard")

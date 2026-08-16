@@ -17,7 +17,7 @@ from scripts.data.capital_data_sources import (
     source_hash,
     utc_timestamp,
 )
-from scripts.data.capital_data_store import DB_PATH, connect_capital_db
+from scripts.data.capital_data_store import DB_PATH, open_capital_db
 from scripts.data.market_data_store import DB_PATH as MARKET_DB_PATH
 from scripts.shared import expected_trade_date, normalize_date_arg
 from scripts.strategy_config import load_strategy_config
@@ -183,7 +183,7 @@ class CapitalDataService:
         if not level_config:
             raise ValueError(f"不支持的申万行业层级: {sw_level}")
         fortune_level = int(level_config["fortune_level"])
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             current = self._latest_mapping_version(conn, target, sw_level)
             if current and not force_rebuild:
                 return self._mapping_summary(conn, current["mapping_version"], reused=True)
@@ -201,7 +201,7 @@ class CapitalDataService:
             "fortune_board_count": len(fortune_boards),
             "mapping_row_count": len(mappings),
         }
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             previous = conn.execute(
                 """SELECT mapping_version,valid_from FROM mapping_versions
                    WHERE sw_level=? AND valid_to IS NULL ORDER BY created_at DESC LIMIT 1""",
@@ -238,7 +238,7 @@ class CapitalDataService:
 
     def mapping_status(self, as_of: str | None = None, sw_level: int = 1) -> dict:
         target = normalize_date_arg(as_of) if as_of else expected_trade_date()
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             current = self._latest_mapping_version(conn, target, int(sw_level))
             if not current:
                 return {"sw_level": int(sw_level), "as_of": target, "status": "NOT_READY"}
@@ -259,7 +259,7 @@ class CapitalDataService:
             if status["status"] != "READY":
                 missing_mappings.append(sw_code)
                 continue
-            with connect_capital_db(self.capital_db_path) as conn:
+            with open_capital_db(self.capital_db_path) as conn:
                 mappings = conn.execute(
                     """SELECT bk_code FROM sector_mappings
                        WHERE mapping_version=? AND sw_code=? AND mapping_quality IN ('high','usable')""",
@@ -296,7 +296,7 @@ class CapitalDataService:
         sw_level = sw_level_from_code(sw_code)
         mapping_summary = self.ensure_sector_mapping(as_of=end, sw_level=sw_level)
         version = mapping_summary["mapping_version"]
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             mappings = [dict(row) for row in conn.execute(
                 "SELECT * FROM sector_mappings WHERE mapping_version=? AND sw_code=? ORDER BY mapping_rank",
                 (version, sw_code),
@@ -337,7 +337,7 @@ class CapitalDataService:
                 self._save_contracts("sector", bk_code, contracts)
 
         components_by_date = defaultdict(list)
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             for mapping in mappings:
                 cached = conn.execute(
                     "SELECT trade_date,metrics_json FROM sector_capital WHERE bk_code=? AND trade_date BETWEEN ? AND ? ORDER BY trade_date",
@@ -436,7 +436,7 @@ class CapitalDataService:
                 break
 
         result = {}
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             for code in requested:
                 cached = conn.execute(
                     "SELECT trade_date,metrics_json FROM stock_capital WHERE code=? AND trade_date BETWEEN ? AND ? ORDER BY trade_date",
@@ -452,7 +452,7 @@ class CapitalDataService:
         return {"start_date": start, "end_date": end, "stocks": result, "errors": errors, "status": status}
 
     def _ensure_board_snapshot(self, target: str, fortune_level: int, force: bool) -> str:
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             if not force:
                 row = conn.execute(
                     """SELECT snapshot_date FROM board_snapshot_runs
@@ -468,7 +468,7 @@ class CapitalDataService:
                 f"缺少 {target} 的财富通行业快照；不得用 {current_target} 当前成分伪装历史映射"
             )
         catalog = self.board_source.fetch_catalog(fortune_level)
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             if force:
                 conn.execute(
                     "DELETE FROM fortune_industry_members WHERE snapshot_date=? AND fortune_level=?",
@@ -486,7 +486,7 @@ class CapitalDataService:
             conn.commit()
 
         for board in catalog:
-            with connect_capital_db(self.capital_db_path) as conn:
+            with open_capital_db(self.capital_db_path) as conn:
                 cached = conn.execute(
                     """SELECT member_count FROM fortune_industry_boards
                        WHERE snapshot_date=? AND fortune_level=? AND bk_code=?""",
@@ -500,7 +500,7 @@ class CapitalDataService:
                 (target, fortune_level, board["bk_code"], item["stock_code"], item.get("stock_name", ""))
                 for item in board_members
             ]
-            with connect_capital_db(self.capital_db_path) as conn:
+            with open_capital_db(self.capital_db_path) as conn:
                 conn.execute(
                     "DELETE FROM fortune_industry_members WHERE snapshot_date=? AND fortune_level=? AND bk_code=?",
                     (target, fortune_level, board["bk_code"]),
@@ -512,7 +512,7 @@ class CapitalDataService:
                 conn.executemany("INSERT INTO fortune_industry_members VALUES(?,?,?,?,?)", members)
                 conn.commit()
 
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             boards = [dict(row) for row in conn.execute(
                 """SELECT bk_code,bk_name,member_count,source_hash FROM fortune_industry_boards
                    WHERE snapshot_date=? AND fortune_level=? ORDER BY bk_code""",
@@ -582,7 +582,7 @@ class CapitalDataService:
             conn.close()
 
     def _load_fortune_inputs(self, snapshot: str, fortune_level: int = 1) -> dict:
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             boards = {row["bk_code"]: {"name": row["bk_name"], "members": set()} for row in conn.execute(
                 """SELECT bk_code,bk_name FROM fortune_industry_boards
                    WHERE snapshot_date=? AND fortune_level=?""",
@@ -628,7 +628,7 @@ class CapitalDataService:
         expected = self._expected_trade_dates(start, end)
         if not expected:
             return False
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             actual = {row[0] for row in conn.execute(
                 f"SELECT trade_date FROM {table} WHERE {key_name}=? AND trade_date BETWEEN ? AND ?",
                 (key_value, start, end),
@@ -660,7 +660,7 @@ class CapitalDataService:
 
     def _save_capital_rows(self, table: str, key_name: str, key_value: str, rows: list[dict], query: str) -> None:
         now = utc_timestamp()
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             for row in rows:
                 trade_date = row.get("trade_date")
                 if not trade_date:
@@ -686,7 +686,7 @@ class CapitalDataService:
             conn.commit()
 
     def _contract_error(self, entity_type: str, entity_code: str, contracts: dict) -> str | None:
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             existing = {row["metric_name"]: dict(row) for row in conn.execute(
                 "SELECT metric_name,source_field_code,source_field_name FROM source_contracts WHERE entity_type=? AND entity_code=?",
                 (entity_type, entity_code),
@@ -716,7 +716,7 @@ class CapitalDataService:
             rows.append((entity_type, entity_code, metric, contract["source_field_code"], contract["source_field_name"], now))
         if not rows:
             return
-        with connect_capital_db(self.capital_db_path) as conn:
+        with open_capital_db(self.capital_db_path) as conn:
             conn.executemany(
                 """INSERT INTO source_contracts VALUES(?,?,?,?,?,?) ON CONFLICT(entity_type,entity_code,metric_name)
                    DO UPDATE SET source_field_code=excluded.source_field_code,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 from scripts.shared import PROJECT_ROOT
@@ -22,6 +23,23 @@ def connect_capital_db(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     create_capital_schema(conn)
     return conn
+
+
+@contextmanager
+def open_capital_db(db_path: Path | str = DB_PATH):
+    """Context manager: begins a transaction on enter, commits on normal exit,
+    rolls back on error, and always closes the connection.
+
+    sqlite3.Connection used as a plain context manager only manages the
+    transaction, not the connection lifetime, so on Windows the file handle
+    stays open until GC and blocks cleanup. This guarantees close().
+    """
+    conn = connect_capital_db(db_path)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def create_capital_schema(conn: sqlite3.Connection) -> None:

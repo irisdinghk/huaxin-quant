@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(os.path.abspath(__file__)).parents[1]))
 
 from scripts.data.capital_data_service import CapitalDataService
 from scripts.data.capital_data_sources import MiaoxiangCapitalSource, RequestBudget
-from scripts.data.capital_data_store import DB_PATH as CAPITAL_DB_PATH, connect_capital_db
+from scripts.data.capital_data_store import DB_PATH as CAPITAL_DB_PATH, open_capital_db
 from scripts.data.market_data_store import DB_PATH as MARKET_DB_PATH
 from scripts.shared import PROJECT_ROOT, expected_trade_date, normalize_date_arg
 from scripts.strategy_config import load_strategy_config
@@ -366,7 +366,7 @@ def build_threshold_reference(config: dict | None = None) -> dict:
 def _mapping_metadata(service: CapitalDataService, candidates: list[dict], as_of: str) -> None:
     status = service.mapping_status(as_of, 2)
     version = status.get("mapping_version")
-    with connect_capital_db(service.capital_db_path) as conn:
+    with open_capital_db(service.capital_db_path) as conn:
         for candidate in candidates:
             mappings = [] if not version else [dict(row) for row in conn.execute(
                 "SELECT bk_code,bk_name,mapping_rank,mapping_weight,mapping_quality,coverage,purity FROM sector_mappings WHERE mapping_version=? AND sw_code=? ORDER BY mapping_rank",

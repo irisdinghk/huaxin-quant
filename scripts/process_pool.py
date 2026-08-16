@@ -174,7 +174,7 @@ if stale_files:
     print(f"  如需刷新，删除 cache/xuangu/ 中旧文件后重新拉取")
 
 if not all_stocks:
-    print("\n  ❌ 无有效缓存文件，请先拉取 xuangu 数据")
+    print("\n  [ERR] 无有效缓存文件，请先拉取 xuangu 数据")
     exit(1)
 
 print(f"\n  Merged unique: {len(all_stocks)} stocks")
