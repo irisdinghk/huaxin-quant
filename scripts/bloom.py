@@ -27,6 +27,21 @@ from scripts.dashboard_vcp import publish as publish_vcp_dashboard
 from scripts.dashboard_signals import publish as publish_signals_dashboard
 from scripts.strategy_config import load_strategy_config
 from scripts.progress_utils import ProgressTracker
+from scripts.io_utils import (
+    FileLock,
+    LockBusyError,
+    atomic_write_csv,
+    atomic_write_json,
+    atomic_write_text,
+)
+from scripts.data.strategy_data_store import (
+    connect as connect_strategy_db,
+    document_dates as strategy_document_dates,
+    load_all_bloom_events,
+    load_bloom_state,
+    load_document as load_strategy_document,
+    save_bloom,
+)
 
 
 BLOOM_STRATEGY_FILE = "04-bloom.json"
@@ -40,6 +55,7 @@ BLOOM_EVENTS_PATH = Path(PROJECT_ROOT) / CONFIG["inputs"]["events_path"]
 BLOOM_INPUT_DIR = Path(PROJECT_ROOT) / CONFIG["outputs"]["review_input_dir"]
 BLOOM_REPORT_DIR = Path(PROJECT_ROOT) / CONFIG["outputs"]["daily_report_dir"]
 BLOOM_STATE_SNAPSHOT_DIR = BLOOM_STATE_PATH.parent / "snapshots"
+BLOOM_LOCK_PATH = BLOOM_STATE_PATH.parent / ".bloom.lock"
 
 LEGACY_STATE_PATH = Path(PROJECT_ROOT) / "bloom" / "bloom_state.csv"
 
@@ -401,6 +417,12 @@ def base_status(row):
 
 
 def read_state():
+    with connect_strategy_db() as conn:
+        dates = strategy_document_dates(conn, "bloom")
+        if dates:
+            rows = load_bloom_state(conn, dates[-1])
+            if rows:
+                return rows
     path = BLOOM_STATE_PATH if BLOOM_STATE_PATH.exists() else LEGACY_STATE_PATH
     if not path.exists():
         return {}
@@ -467,11 +489,7 @@ def write_state(rows):
         -safe_float(r.get("structure_score")),
         r.get("code", ""),
     ))
-    with open(BLOOM_STATE_PATH, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=STATE_FIELDS)
-        writer.writeheader()
-        for row in ordered:
-            writer.writerow({field: row.get(field, "") for field in STATE_FIELDS})
+    atomic_write_csv(BLOOM_STATE_PATH, STATE_FIELDS, ordered)
 
 
 def remove_events_for_date(date_iso):
@@ -494,9 +512,11 @@ def remove_events_for_date(date_iso):
 
 def write_events(date_iso, events):
     kept = remove_events_for_date(date_iso)
-    with open(BLOOM_EVENTS_PATH, "w", encoding="utf-8") as f:
-        for event in kept + events:
-            f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    content = "".join(
+        json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+        for event in kept + events
+    )
+    atomic_write_text(BLOOM_EVENTS_PATH, content)
 
 
 def score_change(prev_row, row):
@@ -1282,8 +1302,7 @@ def build_bloom(payload, previous_payload, date_yy, allow_partial=False, progres
 
 def write_bloom_input(date_yy, bloom):
     path = BLOOM_INPUT_DIR / f"bloom_input_{date_yy}.json"
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(bloom, f, ensure_ascii=False, indent=2)
+    atomic_write_json(path, bloom)
     return path
 
 
@@ -1517,8 +1536,7 @@ def build_markdown(bloom):
 
 def write_markdown(date_yy, markdown):
     path = BLOOM_REPORT_DIR / f"bloom_{date_yy}.md"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(markdown)
+    atomic_write_text(path, markdown)
     return path
 
 
@@ -1551,9 +1569,24 @@ def main():
     args = parser.parse_args()
 
     ensure_dirs()
+    bloom_lock = FileLock(BLOOM_LOCK_PATH, blocking=False, purpose="bloom state publication")
+    try:
+        bloom_lock.acquire()
+    except LockBusyError as exc:
+        print(f"错误: Bloom 状态正在由另一个进程更新: {exc}")
+        sys.exit(1)
 
     date_yy = normalize_date_arg(args.date)
-    quant_path = quant_run_for_date(date_yy) if date_yy else latest_quant_run()
+    with connect_strategy_db() as strategy_conn:
+        database_dates = strategy_document_dates(strategy_conn, "quant")
+    database_stamps = {value.replace("-", "")[2:] for value in database_dates}
+    if date_yy and date_yy in database_stamps:
+        quant_path = QUANT_RUNS_DIR / f"quant_{date_yy}.json"
+    elif not date_yy and database_dates:
+        date_yy = database_dates[-1].replace("-", "")[2:]
+        quant_path = QUANT_RUNS_DIR / f"quant_{date_yy}.json"
+    else:
+        quant_path = quant_run_for_date(date_yy) if date_yy else latest_quant_run()
     if not quant_path:
         print("错误: 未找到模型二 quant run JSON")
         sys.exit(1)
@@ -1563,9 +1596,23 @@ def main():
         sys.exit(1)
     date_yy = match.group(1)
 
-    payload = load_json(quant_path)
-    prev_path = previous_quant_run(date_yy)
-    previous_payload = load_json(prev_path) if prev_path else None
+    trade_date = datetime.strptime(date_yy, "%y%m%d").strftime("%Y-%m-%d")
+    with connect_strategy_db() as strategy_conn:
+        payload = load_strategy_document(strategy_conn, "quant", trade_date)
+    if payload is None:
+        payload = load_json(quant_path)
+    previous_database_dates = [value for value in database_dates if value < trade_date]
+    prev_path = (
+        QUANT_RUNS_DIR / f"quant_{previous_database_dates[-1].replace('-', '')[2:]}.json"
+        if previous_database_dates else previous_quant_run(date_yy)
+    )
+    previous_payload = None
+    if prev_path:
+        previous_date = datetime.strptime(prev_path.stem.rsplit("_", 1)[-1], "%y%m%d").strftime("%Y-%m-%d")
+        with connect_strategy_db() as strategy_conn:
+            previous_payload = load_strategy_document(strategy_conn, "quant", previous_date)
+        if previous_payload is None:
+            previous_payload = load_json(prev_path)
 
     try:
         bloom, new_state, events = build_bloom(payload, previous_payload, date_yy,
@@ -1577,10 +1624,28 @@ def main():
 
     if not args.no_state_update:
         snapshot_path = write_state_snapshot_before(bloom["summary"]["date"])
-        write_state(new_state)
-        write_events(bloom["summary"]["date"], events)
     else:
         snapshot_path = None
+
+    with connect_strategy_db() as strategy_conn:
+        save_bloom(
+            strategy_conn,
+            bloom,
+            new_state if not args.no_state_update else None,
+            events if not args.no_state_update else None,
+            source_path=f"bloom/state/bloom_input_{date_yy}.json",
+        )
+        bloom = load_strategy_document(strategy_conn, "bloom", bloom["summary"]["date"])
+        if not args.no_state_update:
+            new_state = load_bloom_state(strategy_conn, bloom["summary"]["date"])
+            all_events = load_all_bloom_events(strategy_conn)
+
+    if not args.no_state_update:
+        write_state(new_state)
+        atomic_write_text(
+            BLOOM_EVENTS_PATH,
+            "".join(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n" for event in all_events),
+        )
 
     input_path = write_bloom_input(date_yy, bloom)
     report_path = write_markdown(date_yy, build_markdown(bloom))
@@ -1605,6 +1670,7 @@ def main():
     print(f"summary: {bloom['summary']}")
 
     llm_status = (bloom.get("summary", {}).get("llm") or {}).get("status")
+    bloom_lock.release()
     if llm_status == "failed":
         sys.exit(3)
 

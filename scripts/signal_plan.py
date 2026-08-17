@@ -21,6 +21,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.shared import PROJECT_ROOT
 from scripts.strategy_config import load_strategy_config
 from scripts.progress_utils import ProgressTracker
+from scripts.data.strategy_data_store import (
+    connect as connect_strategy_db,
+    document_dates as strategy_document_dates,
+    load_document as load_strategy_document,
+    save_signal_plan,
+)
 
 
 STRATEGY_FILE = "04-signal-plan.json"
@@ -673,7 +679,7 @@ def build_signal_plan(payload, date_yy, progress_file=None):
         if progress_file and (idx % 10 == 0 or idx == total_results - 1):
             try:
                 pt = ProgressTracker(progress_file)
-                pt.step_update("plan", current_stage="筛选候选+生成计划",
+                pt.step_update("signal_plan", current_stage="筛选候选+生成计划",
                                total=total_results, completed=idx + 1,
                                current_code=str(row.get("code", "")))
             except Exception:
@@ -882,7 +888,7 @@ def call_llm_notes(plans, progress_file=None):
             try:
                 first_plan = batch[0] if batch else {}
                 pt = ProgressTracker(progress_file)
-                pt.step_update("plan", current_stage="LLM备注",
+                pt.step_update("signal_plan", current_stage="LLM备注",
                                total=total_batches, completed=batch_idx + 1,
                                current_code=first_plan.get("code", "") if first_plan else "")
             except Exception:
@@ -1099,7 +1105,16 @@ def main():
         print(f"错误: {exc}")
         sys.exit(1)
 
-    quant_path = quant_run_for_date(date_yy) if date_yy else latest_quant_run()
+    with connect_strategy_db() as strategy_conn:
+        database_dates = strategy_document_dates(strategy_conn, "quant")
+    database_stamps = {value.replace("-", "")[2:] for value in database_dates}
+    if date_yy and date_yy in database_stamps:
+        quant_path = QUANT_RUNS_DIR / f"quant_{date_yy}.json"
+    elif not date_yy and database_dates:
+        date_yy = database_dates[-1].replace("-", "")[2:]
+        quant_path = QUANT_RUNS_DIR / f"quant_{date_yy}.json"
+    else:
+        quant_path = quant_run_for_date(date_yy) if date_yy else latest_quant_run()
     if not quant_path:
         print("错误: 未找到模型二 quant run JSON")
         sys.exit(1)
@@ -1109,10 +1124,16 @@ def main():
         sys.exit(1)
     date_yy = match.group(1)
 
-    payload = load_json(quant_path)
+    with connect_strategy_db() as strategy_conn:
+        payload = load_strategy_document(strategy_conn, "quant", datetime.strptime(date_yy, "%y%m%d").strftime("%Y-%m-%d"))
+    if payload is None:
+        payload = load_json(quant_path)
     plan = build_signal_plan(payload, date_yy, progress_file=args.progress_file)
     if not args.no_llm:
         plan = attach_llm_notes(plan, progress_file=args.progress_file)
+    with connect_strategy_db() as strategy_conn:
+        save_signal_plan(strategy_conn, plan, f"signal_plan/signal_plan_{date_yy}.json")
+        plan = load_strategy_document(strategy_conn, "signal_plan", plan["meta"]["date"])
     json_path = write_json_plan(date_yy, plan)
     md_path = write_markdown_plan(date_yy, build_markdown(plan))
 
@@ -1123,6 +1144,10 @@ def main():
     print(f"json: {json_path}")
     print(f"markdown: {md_path}")
     print(f"summary: {plan['summary']}")
+
+    llm_status = plan.get("summary", {}).get("llm", {}).get("status")
+    if not args.no_llm and llm_status == "failed":
+        sys.exit(3)
 
 
 if __name__ == "__main__":

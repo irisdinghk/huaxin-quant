@@ -330,6 +330,19 @@ def choose_recovery(run_dir: Path, requested: str = "auto") -> RecoveryDecision:
 def pid_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        # Windows has no os.kill(pid, 0) probe; use OpenProcess(SYNCHRONIZE).
+        import ctypes
+
+        SYNCHRONIZE = 0x00100000
+        handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        # NULL handle: ERROR_INVALID_PARAMETER (87) means the pid does not
+        # exist; access denied (5) means a live process we cannot open, so
+        # treat it as alive to avoid deleting a live lock.
+        return ctypes.windll.kernel32.GetLastError() != 87
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
