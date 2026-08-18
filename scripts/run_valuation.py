@@ -598,9 +598,9 @@ def main() -> int:
     print(f"  阶段零: {'执行' if stage0_required else '复用'}")
     print(f"  发布: {'否' if args.no_publish else '是'}")
     if not os.environ.get("DEEPSEEK_API_KEY"):
-        print("  ⚠️ 未发现 DEEPSEEK_API_KEY；若本次需要调用 LLM，主流水线会显式失败")
+        print("  [WARN] 未发现 DEEPSEEK_API_KEY；若本次需要调用 LLM，主流水线会显式失败")
     if not os.environ.get("MX_APIKEY") and not args.no_fetch_evidence:
-        print("  ⚠️ 未发现 MX_APIKEY；若检索缓存不可用，主流水线会显式失败")
+        print("  [WARN] 未发现 MX_APIKEY；若检索缓存不可用，主流水线会显式失败")
 
     if args.dry_run:
         if financial_plan["action"] == "fetch":
@@ -662,17 +662,17 @@ def main() -> int:
             terminal = verify_terminal_run(run_dir, args.no_publish)
             summary.update({"status": "done", "run_dir": str(run_dir.relative_to(PROJECT_ROOT)), "terminal": terminal})
             exit_code = 0
-            print(f"\n✅ 模型三总控完成: {run_dir}")
+            print(f"\n[OK] 模型三总控完成: {run_dir}")
         except KeyboardInterrupt:
             summary.update({"status": "failed", "error": "用户中断，总控已终止子进程"})
             if run_dir:
                 summary["run_dir"] = str(run_dir.relative_to(PROJECT_ROOT))
-            print("\n❌ 模型三总控已中断，子进程已终止", file=sys.stderr)
+            print("\n[ERR] 模型三总控已中断，子进程已终止", file=sys.stderr)
         except Exception as exc:
             summary.update({"status": "failed", "error": str(exc)})
             if run_dir:
                 summary["run_dir"] = str(run_dir.relative_to(PROJECT_ROOT))
-            print(f"\n❌ 模型三总控失败: {exc}", file=sys.stderr)
+            print(f"\n[ERR] 模型三总控失败: {exc}", file=sys.stderr)
         finally:
             summary["finished_at"] = datetime.now().isoformat(timespec="seconds")
             summary["exit_code"] = exit_code

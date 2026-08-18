@@ -3266,14 +3266,14 @@ def main():
         if not args.no_publish and manifest["stages"]["dashboard"]["status"] != "done":
             raise PipelineError("Dashboard 发布失败: " + (manifest["stages"]["dashboard"].get("reason") or "unknown"))
         subprocess.run([sys.executable, "scripts/dashboard_valuation.py", "--progress"], cwd=ROOT, capture_output=True)
-        print("✅ 模型三 v3 完成（未发布）" if args.no_publish else f"✅ 模型三 v3 完成: {report_path}")
+        print("[OK] 模型三 v3 完成（未发布）" if args.no_publish else f"[OK] 模型三 v3 完成: {report_path}")
     except Exception as exc:
         if (run_dir / "manifest.json").exists():
             disk_manifest = read_json(run_dir / "manifest.json")
             manifest = merge_manifest_stages(disk_manifest, manifest)
         manifest["status"] = "failed"; manifest["error"] = str(exc); write_json(run_dir / "manifest.json", manifest)
         subprocess.run([sys.executable, "scripts/dashboard_valuation.py", "--progress"], cwd=ROOT, capture_output=True)
-        print(f"❌ 模型三 v3 失败（已保留运行包）: {exc}", file=sys.stderr); sys.exit(2)
+        print(f"[ERR] 模型三 v3 失败（已保留运行包）: {exc}", file=sys.stderr); sys.exit(2)
 
 
 if __name__ == "__main__":

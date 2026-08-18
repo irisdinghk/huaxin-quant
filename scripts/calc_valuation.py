@@ -1333,7 +1333,7 @@ def main():
     else:
         params_path = sys.argv[1]
         if not os.path.exists(params_path):
-            print(f"❌ 参数文件不存在: {params_path}")
+            print(f"[ERR] 参数文件不存在: {params_path}")
             sys.exit(1)
         with open(params_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -1342,7 +1342,7 @@ def main():
     try:
         params = parse_params(raw)
     except ValueError as e:
-        print(f"❌ 参数校验失败:\n{e}")
+        print(f"[ERR] 参数校验失败:\n{e}")
         sys.exit(1)
 
     # 运行估值
@@ -1362,9 +1362,9 @@ def main():
     ranking_row = result.get("ranking_row", {})
     if ranking_row:
         n = update_ranking_csv(ranking_row)
-        print(f"✅ valuation_ranking.csv 已更新 ({n} 行)")
+        print(f"[OK] valuation_ranking.csv 已更新 ({n} 行)")
 
-    print(f"✅ 估值结果: {result_path}")
+    print(f"[OK] 估值结果: {result_path}")
 
     # 摘要输出
     meta = result["_meta"]
@@ -1379,7 +1379,7 @@ def main():
         print(f"  PE(2026E): {pe['final_pe']}x (悲观 {pe.get('pessimistic_pe', '-')}x)")
     print(f"  2026E 基准估值: {total.get('base', '-')} 亿"
           f" / {_market_value_to_per_share(total.get('base'), params['meta']['total_shares'])} 元/股")
-    print(f"  反向检查: {'⚠️ 触发' if rc.get('triggered') else '✅ 未触发'}"
+    print(f"  反向检查: {'[WARN] 触发' if rc.get('triggered') else '[OK] 未触发'}"
           f" (折扣率 {rc.get('discount_rate', '-')})")
 
     # 打印报告片段

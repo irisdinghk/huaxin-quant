@@ -613,7 +613,7 @@ def process_stock(code, name=None, force_refresh=False):
     # 0.2 读取并解析所有财务缓存文件
     raw_files = find_raw_json_files(code)
     if not raw_files:
-        print(f"  ⚠️ 无缓存文件，请先通过 mx-data skill 拉取数据")
+        print(f"  [WARN] 无缓存文件，请先通过 mx-data skill 拉取数据")
         return None
 
     # 检查缓存文件时效：超过 90 天的财报缓存标记为可疑
@@ -625,7 +625,7 @@ def process_stock(code, name=None, force_refresh=False):
         if (now - mtime).days > stale_threshold_days:
             stale_files.append(rf.name)
     if stale_files:
-        print(f"  ⚠️ {len(stale_files)} 个缓存文件超过 {stale_threshold_days} 天，建议重新拉取:")
+        print(f"  [WARN] {len(stale_files)} 个缓存文件超过 {stale_threshold_days} 天，建议重新拉取:")
         for sf in stale_files[:5]:
             print(f"    - {sf[-60:]}")
 
@@ -666,7 +666,7 @@ def process_stock(code, name=None, force_refresh=False):
     briefing_path = CACHE_BRIEFING / f"{code}_{today}.json"
     with open(briefing_path, "w", encoding="utf-8") as f:
         json.dump(briefing, f, ensure_ascii=False, indent=2)
-    print(f"  ✅ 简报册: {briefing_path}")
+    print(f"  [OK] 简报册: {briefing_path}")
 
     return briefing
 
@@ -712,7 +712,7 @@ def main():
             # 从 quant 池初始化
             stocks = read_quant_pool()
             if not stocks:
-                print("❌ 无标的可处理。请先运行模型二，或使用 --code 指定单只标的。")
+                print("[ERR] 无标的可处理。请先运行模型二，或使用 --code 指定单只标的。")
                 sys.exit(1)
 
     if args.test:
@@ -727,7 +727,7 @@ def main():
                 if f.suffix == ".json" and today not in f.name:
                     f.unlink()
                     cleaned += 1
-        print(f"🧹 --no-cache: 已清除 {cleaned} 个旧简报缓存")
+        print(f"[INFO] --no-cache: 已清除 {cleaned} 个旧简报缓存")
 
     # 自动清理 cache/financial/ 中的无用文件（valuate.py 只读 _raw.json，其余为 mx-data skill 副产品）
     fin_cleaned = 0
@@ -737,7 +737,7 @@ def main():
                 f.unlink()
                 fin_cleaned += 1
     if fin_cleaned:
-        print(f"🧹 已清除 cache/financial/ 中 {fin_cleaned} 个无用文件(.xlsx/.txt)")
+        print(f"[INFO] 已清除 cache/financial/ 中 {fin_cleaned} 个无用文件(.xlsx/.txt)")
 
     print(f"待处理标的: {len(stocks)} 只")
     for s in stocks:
