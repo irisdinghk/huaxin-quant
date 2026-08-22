@@ -64,6 +64,7 @@ STRATEGY_VERSION = QUANT_STRATEGY["strategy_version"]
 VCP_CFG = QUANT_STRATEGY["vcp"]
 POST_BREAKOUT_CFG = VCP_CFG["post_breakout"]
 POST_GROUP_RESET_CFG = VCP_CFG["post_group_reset"]
+STRONG_IMPULSE_CONTEXT_CFG = VCP_CFG.get("strong_impulse_context", {})
 BASE_CFG = QUANT_STRATEGY["base_rules"]
 CONTRACTION_CFG = QUANT_STRATEGY["contraction_rules"]
 STAGE_CFG = QUANT_STRATEGY["stage_rules"]
@@ -72,6 +73,7 @@ SETUP_CFG = QUANT_STRATEGY["setup_rules"]
 SCORE_CFG = QUANT_STRATEGY["scores"]
 CLASSIFICATION_CFG = QUANT_STRATEGY["classification"]
 SETUP_SCORING_CFG = QUANT_STRATEGY.get("setup_scoring", {})
+PRICE_ADJUSTMENT_CFG = QUANT_STRATEGY["price_adjustment"]
 
 TEST_CODES = [
     "688256", "301329", "300394", "300308", "002028",
@@ -452,6 +454,7 @@ def has_intraday_close_divergence(contraction):
 def detect_contractions(df):
     swings = find_close_swings(df)
     contractions = []
+    required_right_days = VCP_SWING_WINDOW
     for i, swing in enumerate(swings[:-1]):
         if swing["type"] != "high" or swings[i + 1]["type"] != "low":
             continue
@@ -505,8 +508,96 @@ def detect_contractions(df):
             "duration_days": int(duration),
             "avg_volume": float(segment["volume"].mean()),
             "recovery_pct": round(float(recovery_pct), 2),
+            "confirmation_status": "CONFIRMED",
+            "right_confirm_days": required_right_days,
+            "required_right_confirm_days": required_right_days,
         })
     return contractions
+
+
+def detect_right_edge_provisional_contraction(df, confirmed_contractions):
+    """Recognize one still-unconfirmed standard contraction at the live right edge."""
+    cfg = VCP_CFG.get("right_edge_provisional", {})
+    if not cfg.get("enabled", False) or df is None or df.empty:
+        return None
+
+    required_right_days = VCP_SWING_WINDOW
+    if required_right_days <= 0 or len(df) < VCP_MIN_PULLBACK_DAYS + VCP_SWING_WINDOW:
+        return None
+
+    start = max(0, len(df) - VCP_LOOKBACK)
+    latest_confirmed_end = max(
+        (item["end_idx"] for item in confirmed_contractions),
+        default=start - 1,
+    )
+    first_high_idx = max(start + VCP_SWING_WINDOW, latest_confirmed_end + 1)
+    first_edge_low_idx = max(first_high_idx + VCP_MIN_PULLBACK_DAYS - 1, len(df) - required_right_days)
+    candidates = []
+
+    for low_idx in range(first_edge_low_idx, len(df)):
+        low_close = float(df.iloc[low_idx]["close"])
+        right_closes = df.iloc[low_idx + 1:]["close"].astype(float)
+        if not right_closes.empty and not (right_closes > low_close).all():
+            continue
+
+        min_high_idx = max(first_high_idx, low_idx - VCP_MAX_PULLBACK_DAYS + 1)
+        max_high_idx = low_idx - VCP_MIN_PULLBACK_DAYS + 1
+        for high_idx in range(min_high_idx, max_high_idx + 1):
+            high_close = float(df.iloc[high_idx]["close"])
+            left_closes = df.iloc[high_idx - VCP_SWING_WINDOW:high_idx]["close"].astype(float)
+            if len(left_closes) < VCP_SWING_WINDOW or not (high_close > left_closes).all():
+                continue
+            pullback_closes = df.iloc[high_idx + 1:low_idx + 1]["close"].astype(float)
+            if pullback_closes.empty or not (high_close > pullback_closes).all():
+                continue
+
+            after_high = df.iloc[high_idx + 1:]["close"].astype(float)
+            if after_high.empty or not (low_close < after_high.drop(index=df.index[low_idx])).all():
+                continue
+
+            duration = low_idx - high_idx + 1
+            pullback_pct = (low_close - high_close) / high_close * 100 if high_close else 0
+            abs_pullback = abs(pullback_pct)
+            if pullback_pct >= 0 or not VCP_MIN_PULLBACK_PCT <= abs_pullback <= VCP_MAX_PULLBACK_PCT:
+                continue
+
+            segment = df.iloc[high_idx:low_idx + 1]
+            intraday_high = float(segment["high"].max())
+            intraday_low = float(segment["low"].min())
+            intraday_pullback_pct = (
+                (intraday_low - intraday_high) / intraday_high * 100
+                if intraday_high else 0
+            )
+            recovery_pct = (
+                (float(right_closes.max()) - low_close) / low_close * 100
+                if not right_closes.empty and low_close else 0
+            )
+            candidates.append({
+                "start_idx": high_idx,
+                "end_idx": low_idx,
+                "start_date": str(df.iloc[high_idx]["date"]),
+                "end_date": str(df.iloc[low_idx]["date"]),
+                "high_price": intraday_high,
+                "low_price": intraday_low,
+                "start_close": round(high_close, 2),
+                "end_close": round(low_close, 2),
+                "close_pullback_pct": round(pullback_pct, 2),
+                "intraday_high": round(intraday_high, 2),
+                "intraday_low": round(intraday_low, 2),
+                "intraday_pullback_pct": round(intraday_pullback_pct, 2),
+                "pullback_pct": round(pullback_pct, 2),
+                "duration_days": int(duration),
+                "avg_volume": float(segment["volume"].mean()),
+                "recovery_pct": round(recovery_pct, 2),
+                "confirmation_status": "PROVISIONAL",
+                "right_confirm_days": int(len(df) - low_idx - 1),
+                "required_right_confirm_days": required_right_days,
+            })
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item["end_idx"], item["start_idx"]), reverse=True)
+    return candidates[0]
 
 
 def contraction_decrease_status(contractions):
@@ -584,6 +675,82 @@ def contraction_group_span_days(group):
     if not group:
         return 0
     return group[-1]["end_idx"] - group[0]["start_idx"] + 1
+
+
+def contraction_group_signature(group):
+    """Stable identity for comparing a frozen VCP group across snapshots."""
+    return tuple(
+        (item.get("start_idx"), item.get("end_idx"))
+        for item in (group or [])
+    )
+
+
+def prior_breakout_vcp_eligible(df, group, structure_pivot, breakout_idx):
+    """Qualify a price boundary as a valid VCP breakout using only D-1 data."""
+    if breakout_idx is None or breakout_idx <= 0:
+        return False
+    pre_breakout = detect_vcp_structure(
+        df.iloc[:breakout_idx], detect_consumed_breakout=False
+    )
+    detected_pivot = safe_float(pre_breakout.get("structure_pivot"))
+    frozen_pivot = safe_float(structure_pivot)
+    same_pivot = (
+        detected_pivot is not None
+        and frozen_pivot is not None
+        and abs(detected_pivot - frozen_pivot) < 1e-6
+    )
+    return all([
+        pre_breakout.get("has_structure") is True,
+        pre_breakout.get("state") in {"VCP_FORMING", "VCP_MATURE", "VCP_TIGHT"},
+        contraction_group_signature(pre_breakout.get("contraction_group") or [])
+        == contraction_group_signature(group),
+        same_pivot,
+    ])
+
+
+def find_latest_consumed_breakout(df, contractions):
+    """Find the latest established VCP that broke out before a newer contraction.
+
+    A single pullback is deliberately insufficient for this boundary: otherwise a
+    normal recovery above one swing high would split many legitimate developing
+    VCPs.  Once a group of at least two contractions breaks out before the next
+    contraction starts, however, those contractions belong to the consumed VCP.
+    """
+    if len(contractions) < 3:
+        return None
+
+    events = []
+    for cluster in split_contraction_clusters(contractions):
+        for next_pos in range(2, len(cluster)):
+            next_contraction = cluster[next_pos]
+            prior_df = df.iloc[:next_contraction["start_idx"]]
+            prior_info, _ = select_current_vcp_group(
+                prior_df, cluster[:next_pos], detect_consumed_breakout=False
+            )
+            if not prior_info or len(prior_info.get("group") or []) < 2:
+                continue
+            breakout = prior_info.get("breakout")
+            if not breakout or breakout["idx"] >= next_contraction["start_idx"]:
+                continue
+            group = prior_info["group"]
+            current_lifecycle = evaluate_vcp_group(df, group)
+            vcp_eligible = prior_breakout_vcp_eligible(
+                df, group, prior_info.get("structure_pivot"), breakout["idx"]
+            )
+            events.append({
+                "group": group,
+                "breakout": breakout,
+                "vcp_eligible": vcp_eligible,
+                "post_breakout_state": current_lifecycle.get("post_breakout_state"),
+                "post_breakout_failure": current_lifecycle.get("post_breakout_failure"),
+                "structure_valid": prior_info.get("structure_valid", False),
+                "structure_pivot": prior_info.get("structure_pivot"),
+                "volume_pattern": volume_pattern_for_contractions(group, df.iloc[-1]),
+                "next_contraction_start_idx": next_contraction["start_idx"],
+            })
+    if not events:
+        return None
+    return max(events, key=lambda item: (item["breakout"]["idx"], len(item["group"])))
 
 
 def _check_bottom_lifting(contractions, threshold_pct=0.0):
@@ -902,7 +1069,7 @@ def detect_contraction_extensions(df, contractions, current):
     return extensions
 
 
-def select_current_vcp_group(df, contractions):
+def select_current_vcp_group(df, contractions, detect_consumed_breakout=True):
     """Select the most recent contraction group that is still relevant now."""
     if not contractions:
         return None, None
@@ -913,11 +1080,25 @@ def select_current_vcp_group(df, contractions):
     reset_events = []
     failure_boundary_idx = None
     active_cluster = split_contraction_clusters(contractions)[-1]
+    consumed_breakout = (
+        find_latest_consumed_breakout(df, active_cluster)
+        if detect_consumed_breakout else None
+    )
+    consumed_breakout_idx = (
+        consumed_breakout["breakout"]["idx"] if consumed_breakout else None
+    )
     max_size = min(CONTRACTION_CFG["max_recent_contractions"], len(active_cluster))
     max_span = CONTRACTION_CFG.get("max_group_span_days")
     for size in range(max_size, 0, -1):
         for end in range(len(active_cluster), size - 1, -1):
             group = active_cluster[end - size:end]
+            if (
+                consumed_breakout_idx is not None
+                and group[0]["start_idx"] <= consumed_breakout_idx < group[-1]["start_idx"]
+            ):
+                # Never rebuild a candidate by mixing contractions from both
+                # sides of an already confirmed VCP breakout.
+                continue
             if max_span is not None and contraction_group_span_days(group) > max_span:
                 continue
             if contraction_group_has_reset_expansion(group):
@@ -973,6 +1154,17 @@ def select_current_vcp_group(df, contractions):
             if item[1]["group"][0]["start_idx"] > failure_boundary_idx
         ]
 
+    if consumed_breakout_idx is not None and candidates:
+        fresh_candidates = [
+            item for item in candidates
+            if item[1]["group"][0]["start_idx"] > consumed_breakout_idx
+        ]
+        if fresh_candidates:
+            candidates = fresh_candidates
+            if consumed_breakout.get("vcp_eligible"):
+                for _, info in candidates:
+                    info["prior_breakout_context"] = consumed_breakout
+
     if candidates and reset_events:
         for _, info in candidates:
             info["rebuild_after_reset"] = True
@@ -983,7 +1175,7 @@ def select_current_vcp_group(df, contractions):
     return None, best_invalid
 
 
-def detect_vcp_structure(df):
+def detect_vcp_structure(df, detect_consumed_breakout=True):
     latest = df.iloc[-1]
     n = len(df)
     conditions = []
@@ -997,6 +1189,10 @@ def detect_vcp_structure(df):
         "structure_count": 0,
         "contractions": [],
         "contraction_count": 0,
+        "confirmed_contraction_count": 0,
+        "provisional_contraction_count": 0,
+        "effective_contraction_count": 0,
+        "contraction_confirmation_status": "NONE",
         "contraction_pcts": "",
         "contraction_days": "",
         "contraction_extension_tags": [],
@@ -1020,6 +1216,7 @@ def detect_vcp_structure(df):
         "vcp_quality": "D",
         "watch_priority": "none",
         "structure_risk_flags": [],
+        "prior_breakout_context": None,
     }
     if n < BASE_CFG["min_data_days"]:
         return empty
@@ -1039,14 +1236,31 @@ def detect_vcp_structure(df):
         base_ok = False
         misses.append("近120日回撤过深")
 
-    contractions = detect_contractions(df)
-    current, invalid_group = select_current_vcp_group(df, contractions)
+    confirmed_contractions = detect_contractions(df)
+    provisional_contraction = detect_right_edge_provisional_contraction(
+        df, confirmed_contractions
+    )
+    contractions = [*confirmed_contractions]
+    if provisional_contraction:
+        contractions.append(provisional_contraction)
+    current, invalid_group = select_current_vcp_group(
+        df, contractions, detect_consumed_breakout=detect_consumed_breakout
+    )
     contraction_extensions = []
     contraction_extension_score = 0
     contraction_extension_tags = []
     group = current["group"] if current else []
     recent = group[-CONTRACTION_CFG["max_recent_contractions"]:]
     count = len(group)
+    confirmed_count = sum(
+        item.get("confirmation_status", "CONFIRMED") == "CONFIRMED"
+        for item in group
+    )
+    provisional_count = sum(
+        item.get("confirmation_status") == "PROVISIONAL"
+        for item in group
+    )
+    confirmation_status = "PROVISIONAL" if provisional_count else "CONFIRMED" if count else "NONE"
     decrease = contraction_decrease_status(group)
     volume_pattern = volume_pattern_for_contractions(group, latest)
     pivot_price = current["pivot_price"] if current else None
@@ -1065,6 +1279,7 @@ def detect_vcp_structure(df):
     rebuild_after_reset = bool(current and current.get("rebuild_after_reset"))
     breakout = current["breakout"] if current else None
     breakout_days = current["breakout_days"] if current else None
+    prior_breakout_context = current.get("prior_breakout_context") if current else None
 
     if not current and invalid_group:
         structure_pivot = invalid_group["structure_pivot"]
@@ -1081,10 +1296,17 @@ def detect_vcp_structure(df):
         breakout = invalid_group["breakout"]
         breakout_days = invalid_group["breakout_days"]
 
-    if contractions:
-        conditions.append(f"历史扫描共{len(contractions)}轮收缩")
+    if confirmed_contractions:
+        conditions.append(f"历史扫描共{len(confirmed_contractions)}轮确认收缩")
+    if provisional_contraction:
+        right_days = provisional_contraction["right_confirm_days"]
+        required_days = provisional_contraction["required_right_confirm_days"]
+        conditions.append(f"最右端候选收缩，右侧确认{right_days}/{required_days}日")
     if count:
-        conditions.append(f"{min(count, CONTRACTION_CFG['max_recent_contractions'])}轮有效收缩")
+        conditions.append(
+            f"{min(count, CONTRACTION_CFG['max_recent_contractions'])}轮有效收缩"
+            f"（{confirmed_count}确认+{provisional_count}候选）"
+        )
     else:
         misses.append("未识别当前有效收缩轮次")
         if structure_invalid_reason:
@@ -1200,6 +1422,10 @@ def detect_vcp_structure(df):
         "contractions": contractions,
         "contraction_group": group,
         "contraction_count": count,
+        "confirmed_contraction_count": confirmed_count,
+        "provisional_contraction_count": provisional_count,
+        "effective_contraction_count": count,
+        "contraction_confirmation_status": confirmation_status,
         "contraction_pcts": " -> ".join(f'{contraction_pullback_pct(c):.2f}%' for c in recent),
         "contraction_days": " -> ".join(str(c["duration_days"]) for c in recent),
         "contraction_extension_tags": contraction_extension_tags,
@@ -1224,6 +1450,7 @@ def detect_vcp_structure(df):
         "vcp_quality": quality_map.get(state, "D"),
         "watch_priority": priority_map.get(state, "none"),
         "structure_risk_flags": structure_risk_flags,
+        "prior_breakout_context": prior_breakout_context,
     }
 
 
@@ -1252,6 +1479,16 @@ def pullback_volume_confirmed(df, structure, cfg):
     if recent_avg_volume <= last_avg_volume * cfg.get("current_low_volume_ratio", 1.0):
         return True, "segment_low_volume"
     return False, "recent_volume_not_low"
+
+
+def pullback_confirmation_close(structure):
+    """Return the close-swing low used to confirm PULLBACK stabilization."""
+    group = structure.get("contraction_group") or []
+    if group:
+        end_close = safe_float(group[-1].get("end_close"))
+        if end_close is not None and end_close > 0:
+            return end_close
+    return None
 
 
 def setup_quality(score):
@@ -1479,12 +1716,12 @@ def score_pullback_setup(df, structure, volume_ok, volume_reason):
     else:
         misses.append("缩量质量不足")
 
-    last_low = safe_float(structure.get("last_contraction_low"))
+    confirmation_close = pullback_confirmation_close(structure)
     ma20_slope = safe_float(latest.get("MA20_slope"), 0)
-    if last_low and latest["close"] > last_low * 1.05 and ma20_slope >= 0:
+    if confirmation_close and latest["close"] > confirmation_close * 1.05 and ma20_slope >= 0:
         score += 5
         reasons.append("前低上方确认强")
-    elif last_low and latest["close"] > last_low * 1.02 and ma20_slope >= -0.03:
+    elif confirmation_close and latest["close"] > confirmation_close * 1.02 and ma20_slope >= -0.03:
         score += 2
         reasons.append("前低守住")
     else:
@@ -1593,12 +1830,35 @@ def score_retest_setup(df, breakout):
     return score, reasons, misses
 
 
+def post_breakout_early_pullback_allowed(structure, cfg=None):
+    """Allow a one-contraction new VCP to use PULLBACK after a strong breakout."""
+    cfg = cfg or SETUP_CFG["pullback_buy"]
+    gate = cfg.get("post_breakout_early_gate") or {}
+    prior = structure.get("prior_breakout_context") or {}
+    group = structure.get("contraction_group") or []
+    prior_pivot = safe_float(prior.get("structure_pivot"))
+    last_low = safe_float(structure.get("last_contraction_low"))
+    if prior_pivot is None or last_low is None:
+        return False
+    return all([
+        bool(gate),
+        structure.get("state") == "VCP_EARLY",
+        len(group) >= 1,
+        structure.get("prior_breakout_context_tag") == "之前已有突破并强势整理",
+        safe_float(structure.get("prior_breakout_bonus_score"), -1)
+        >= gate.get("min_prior_breakout_score", 0),
+        structure.get("volume_pattern") in set(gate.get("allowed_volume_patterns", [])),
+        last_low >= prior_pivot * gate.get("min_low_vs_prior_pivot_ratio", 1.0),
+    ])
+
+
 def detect_pullback_buy(df, structure, overheat):
     latest = df.iloc[-1]
     cfg = SETUP_CFG["pullback_buy"]
     if structure.get("post_breakout_state") != "PRE_BREAKOUT":
         return base_setup_result(False, "原VCP已突破，禁止旧结构PULLBACK_BUY")
-    if structure.get("state") not in set(cfg["allowed_stages"]):
+    early_post_breakout = post_breakout_early_pullback_allowed(structure, cfg)
+    if structure.get("state") not in set(cfg["allowed_stages"]) and not early_post_breakout:
         return base_setup_result(False, "VCP结构阶段不足")
     if setup_hard_reject(overheat, cfg):
         return base_setup_result(False, "风险硬排除")
@@ -1608,7 +1868,28 @@ def detect_pullback_buy(df, structure, overheat):
     near_ma20 = pd.notna(latest.get("distance_ma20")) and ma20_min <= latest["distance_ma20"] <= ma20_max
     near_ma60 = pd.notna(latest.get("distance_ma60")) and ma60_min <= latest["distance_ma60"] <= ma60_max
     low20 = latest.get("low_20")
-    last_low = structure.get("last_contraction_low")
+    last_low = safe_float(structure.get("last_contraction_low"))
+    confirmation_close = pullback_confirmation_close(structure)
+    early_gate = cfg.get("post_breakout_early_gate") or {}
+    last_low_distance = (
+        (safe_float(latest.get("close")) - confirmation_close) / confirmation_close * 100
+        if confirmation_close else None
+    )
+    last_low_distance_range = early_gate.get("last_low_distance_range_pct", [0, 0])
+    near_last_low = bool(
+        early_post_breakout
+        and last_low_distance is not None
+        and last_low_distance_range[0] <= last_low_distance <= last_low_distance_range[1]
+    )
+    location_ok = near_ma20 or near_ma60 or near_last_low
+    last_low_confirm_pct = (
+        early_gate.get("entry_confirm_buffer_pct", cfg["last_low_buffer_pct"])
+        if early_post_breakout else cfg["last_low_buffer_pct"]
+    )
+    last_low_required_price = (
+        confirmation_close * (1 + last_low_confirm_pct / 100)
+        if confirmation_close is not None else None
+    )
     volume_ok, volume_reason = pullback_volume_confirmed(df, structure, cfg)
     volume_floor_ok = volume_ok or safe_float(latest.get("volume_dry_up"), 999) < 0.9
     ma20 = safe_float(latest.get("MA20"))
@@ -1630,6 +1911,7 @@ def detect_pullback_buy(df, structure, overheat):
     )
     plan_inputs = {
         "allowed": True,
+        "post_breakout_early_context": early_post_breakout,
         "anchor": None,
         "support_price": None,
         "invalid_price": None,
@@ -1637,9 +1919,18 @@ def detect_pullback_buy(df, structure, overheat):
         "ma20_price_high": ma20 * (1 + ma20_max / 100) if ma20 is not None else None,
         "ma60_price_low": ma60 * (1 + ma60_min / 100) if ma60 is not None else None,
         "ma60_price_high": ma60 * (1 + ma60_max / 100) if ma60 is not None else None,
-        "last_low_required_price": (
-            last_low * (1 + cfg["last_low_buffer_pct"] / 100)
-            if last_low is not None else None
+        "last_low_required_price": last_low_required_price,
+        "last_low_confirmation_anchor": "end_close",
+        "last_low_confirmation_price": confirmation_close,
+        "last_low_price_low": last_low_required_price if near_last_low else None,
+        "last_low_price_high": (
+            confirmation_close * (1 + early_gate.get("entry_max_distance_pct", last_low_confirm_pct) / 100)
+            if near_last_low and confirmation_close is not None else None
+        ),
+        "last_low_ideal_price_low": last_low_required_price if near_last_low else None,
+        "last_low_ideal_price_high": (
+            confirmation_close * (1 + min(3.0, early_gate.get("entry_max_distance_pct", 3.0)) / 100)
+            if near_last_low and confirmation_close is not None else None
         ),
         "volume_dry_up_threshold": cfg["volume_dry_up_lt"],
         "volume_floor_threshold": vol_ma20 * 0.9 if vol_ma20 is not None else None,
@@ -1652,30 +1943,36 @@ def detect_pullback_buy(df, structure, overheat):
         "blocked_risk_flags": cfg["blocked_risk_flags"],
     }
     hard_conditions = [
-        near_ma20 or near_ma60,
+        location_ok,
         volume_floor_ok,
-        last_low is not None and latest["close"] > last_low * (1 + cfg["last_low_buffer_pct"] / 100),
+        last_low_required_price is not None and latest["close"] > last_low_required_price,
         safe_float(latest.get("MA20_slope"), 0) >= cfg["min_ma20_slope"],
         not any(flag in overheat["risk_flags"] for flag in cfg["blocked_risk_flags"]),
     ]
     action_quality_score, reasons, misses = score_pullback_setup(df, structure, volume_ok, volume_reason)
+    if early_post_breakout:
+        reasons.append("前序突破强势，新VCP一轮缩量收缩")
     score, pattern_score, reasons, misses, score_context = finalize_setup_score(
         "PULLBACK_BUY", action_quality_score, reasons, misses, structure, overheat
     )
     hit = all(hard_conditions) and score >= cfg["min_setup_score"]
-    anchor = "MA20" if near_ma20 else "MA60" if near_ma60 else ""
-    support = safe_float(latest.get(anchor)) if anchor else safe_float(latest.get("MA20"))
+    anchor = "MA20" if near_ma20 else "MA60" if near_ma60 else "last_contraction_low" if near_last_low else ""
+    support = last_low if anchor == "last_contraction_low" else safe_float(latest.get(anchor)) if anchor else safe_float(latest.get("MA20"))
     invalid = None
     if support:
-        invalid = min(support * cfg["invalid_support_ratio"], safe_float(low20, support) * cfg["invalid_low20_ratio"])
+        invalid = (
+            last_low * cfg["invalid_low20_ratio"]
+            if anchor == "last_contraction_low"
+            else min(support * cfg["invalid_support_ratio"], safe_float(low20, support) * cfg["invalid_low20_ratio"])
+        )
     plan_inputs["anchor"] = anchor
     plan_inputs["support_price"] = support
     plan_inputs["invalid_price"] = invalid
-    if not (near_ma20 or near_ma60):
-        misses.append("未靠近MA20/MA60")
+    if not location_ok:
+        misses.append("未靠近MA20/MA60/新收缩下沿")
     if not volume_floor_ok:
         misses.append("回踩缩量不足")
-    if last_low is None or latest["close"] <= last_low * (1 + cfg["last_low_buffer_pct"] / 100):
+    if last_low_required_price is None or latest["close"] <= last_low_required_price:
         misses.append("最近收缩低点未守住")
     if safe_float(latest.get("MA20_slope"), 0) < cfg["min_ma20_slope"]:
         misses.append("MA20斜率偏弱")
@@ -2116,7 +2413,8 @@ def build_setup_score_context(df, structure, current_score):
     if breakout_context:
         context["BREAKOUT_BUY"] = breakout_context
 
-    breakout = structure.get("breakout") or {}
+    prior_breakout = structure.get("prior_breakout_context") or {}
+    breakout = structure.get("breakout") or prior_breakout.get("breakout") or {}
     breakout_idx = breakout.get("idx")
     retest_context = setup_anchor_snapshot(df, breakout_idx)
     if retest_context:
@@ -2129,6 +2427,140 @@ def build_setup_score_context(df, structure, current_score):
             retest_context["breakout_action_score"] = breakout_action_score
         context["RETEST_BUY"] = retest_context
     return context
+
+
+def attach_prior_breakout_bonus(structure):
+    """Expose a non-additive reference score for a new post-breakout VCP."""
+    prior = structure.get("prior_breakout_context") or {}
+    strong_states = {
+        "POST_BREAKOUT_HOT",
+        "POST_BREAKOUT_RETEST",
+        "POST_BREAKOUT_CONSOLIDATING",
+    }
+    retest_context = (structure.get("setup_score_context") or {}).get("RETEST_BUY") or {}
+    score = round_or_none(retest_context.get("structure_score"))
+    breakout = prior.get("breakout") or {}
+    if (
+        not prior
+        or prior.get("post_breakout_state") not in strong_states
+        or prior.get("post_breakout_failure")
+        or score is None
+        or not structure.get("contraction_group")
+    ):
+        structure["prior_breakout_bonus_score"] = None
+        structure["prior_breakout_bonus_reasons"] = []
+        structure["prior_breakout_context_tag"] = ""
+        return
+
+    structure["prior_breakout_bonus_score"] = score
+    structure["prior_breakout_bonus_reasons"] = [
+        (
+            f"前序VCP于{breakout.get('date', '—')}突破原Pivot "
+            f"{safe_float(prior.get('structure_pivot'), 0):.2f}"
+        ),
+        "突破后保持强势整理并形成当前新VCP",
+        f"附加分采用突破前冻结结构分{score:g}，不计入当前结构分",
+    ]
+    structure["prior_breakout_context_tag"] = "之前已有突破并强势整理"
+
+
+def attach_strong_impulse_context(df, structure):
+    """Expose a non-scoring tag when a new VCP follows a strong price-volume impulse."""
+    cfg = STRONG_IMPULSE_CONTEXT_CFG
+    group = structure.get("contraction_group") or []
+    if (
+        not cfg.get("enabled")
+        or structure.get("prior_breakout_context_tag")
+        or structure.get("state") not in set(cfg.get("allowed_stages", []))
+        or structure.get("volume_pattern") not in set(cfg.get("allowed_volume_patterns", []))
+        or not structure.get("structure_valid")
+        or not group
+    ):
+        return
+
+    start_idx = group[0].get("start_idx")
+    if start_idx is None:
+        return
+    start_idx = int(start_idx)
+    lookback = int(cfg.get("lookback_days", 10))
+    baseline_days = int(cfg.get("baseline_volume_days", 20))
+    impulse_start = max(0, start_idx - lookback)
+    baseline_start = max(0, impulse_start - baseline_days)
+    impulse = df.iloc[impulse_start:start_idx + 1]
+    baseline = df.iloc[baseline_start:impulse_start]
+    if impulse.empty or baseline.empty:
+        return
+
+    base_close = safe_float(impulse["close"].min())
+    peak_close = safe_float(impulse["close"].max())
+    peak_position = int(impulse["close"].to_numpy().argmax()) + impulse_start
+    peak_volume = safe_float(impulse["volume"].max())
+    baseline_volume = safe_float(baseline["volume"].mean())
+    current_close = safe_float(df.iloc[-1].get("close"))
+    current_volume = safe_float(df.iloc[-1].get("volume"))
+    post_start_high = safe_float(df.iloc[start_idx:]["high"].max())
+    last_pullback = abs(contraction_pullback_pct(group[-1]))
+    if not all([
+        base_close and peak_close and peak_volume and baseline_volume,
+        current_close and current_volume and post_start_high,
+    ]):
+        return
+
+    gain_pct = (peak_close / base_close - 1) * 100
+    peak_volume_ratio = peak_volume / baseline_volume
+    current_drawdown_pct = (current_close / post_start_high - 1) * 100
+    current_volume_ratio = current_volume / peak_volume
+    if not all([
+        gain_pct >= cfg.get("min_gain_pct", 12.0),
+        peak_volume_ratio >= cfg.get("min_peak_volume_ratio", 1.5),
+        start_idx - peak_position <= cfg.get("max_peak_lead_days", 2),
+        current_drawdown_pct >= -cfg.get("max_current_drawdown_pct", 12.0),
+        last_pullback <= cfg.get("max_contraction_pullback_pct", 12.0),
+        current_volume_ratio <= cfg.get("max_current_vs_peak_volume_ratio", 0.55),
+    ]):
+        return
+
+    structure["prior_breakout_bonus_score"] = None
+    structure["prior_breakout_bonus_reasons"] = [
+        f"当前VCP形成前出现放量启动，近{lookback}日最大涨幅{gain_pct:.1f}%",
+        f"启动峰值成交量为此前{baseline_days}日均量的{peak_volume_ratio:.1f}倍",
+        (
+            f"启动后收盘回撤{abs(current_drawdown_pct):.1f}%，"
+            f"当前成交量较峰值缩减{(1 - current_volume_ratio) * 100:.1f}%"
+        ),
+        "仅作为机会附加信息，不计入当前结构分或买点权限",
+    ]
+    structure["prior_breakout_context_tag"] = "放量启动后强势整理"
+
+
+def retest_structure_for_detection(structure):
+    """Use the prior consumed VCP only for its still-active RETEST lifecycle."""
+    prior = structure.get("prior_breakout_context") or {}
+    if (
+        structure.get("post_breakout_state") != "PRE_BREAKOUT"
+        or prior.get("post_breakout_state") != "POST_BREAKOUT_RETEST"
+    ):
+        return structure
+
+    retest_context = (structure.get("setup_score_context") or {}).get("RETEST_BUY") or {}
+    parent = dict(structure)
+    parent.update({
+        "structure_valid": bool(prior.get("structure_valid")),
+        "state": retest_context.get("structure_stage") or structure.get("state"),
+        "post_breakout_state": prior.get("post_breakout_state"),
+        "breakout": prior.get("breakout"),
+        "contraction_group": prior.get("group") or [],
+        "volume_pattern": prior.get("volume_pattern", "mixed"),
+    })
+    return parent
+
+
+def frozen_breakout_structure_score(structure):
+    """Return the pre-breakout VCP score already frozen in setup context."""
+    if structure.get("post_breakout_state", "PRE_BREAKOUT") == "PRE_BREAKOUT":
+        return None
+    context = (structure.get("setup_score_context") or {}).get("RETEST_BUY") or {}
+    return round_or_none(context.get("structure_score"))
 
 
 def structure_stage_from_internal(state):
@@ -2241,6 +2673,15 @@ def choose_setup_detail(setup_signal, pullback, breakout, retest):
     return base_setup_result(False, "无买点触发")
 
 
+def setup_reference_prices(setup_detail):
+    """Return top-level price references for the selected setup only."""
+    return (
+        setup_detail.get("support_price"),
+        setup_detail.get("invalid_price"),
+        setup_detail.get("breakout_level"),
+    )
+
+
 def screen(df, code=None):
     """确定性识别 VCP 结构阶段和触发信号，返回结构化结果。"""
     latest = df.iloc[-1]
@@ -2294,8 +2735,12 @@ def screen(df, code=None):
             "post_breakout_state": "PRE_BREAKOUT",
             "post_breakout_failure": None,
             "structure_breakout_date": "",
+            "structure_breakout_score": None,
             "structure_breakout_level": None,
             "breakout_days": None,
+            "prior_breakout_bonus_score": None,
+            "prior_breakout_bonus_reasons": [],
+            "prior_breakout_context_tag": "",
             "vcp_quality": "D",
             "contractions": [],
             "contraction_group": [],
@@ -2318,16 +2763,17 @@ def screen(df, code=None):
     score = score_setup(df, structure, {}, {}, overheat)
     structure["structure_score_estimate"] = score["structure_score"]
     structure["setup_score_context"] = build_setup_score_context(df, structure, score)
+    attach_prior_breakout_bonus(structure)
+    attach_strong_impulse_context(df, structure)
+    structure_breakout_score = frozen_breakout_structure_score(structure)
     pullback = detect_pullback_buy(df, structure, overheat)
     breakout = detect_breakout_buy(df, structure, overheat)
-    retest = detect_retest_buy(df, structure, overheat, code=code)
+    retest = detect_retest_buy(df, retest_structure_for_detection(structure), overheat, code=code)
     structure_type, setup_signal, action_hint, suggested_position = classify_result(structure, pullback, breakout, retest, score, overheat)
     structure_stage = structure_stage_from_internal(structure.get("state"))
     setup_detail = choose_setup_detail(setup_signal, pullback, breakout, retest)
 
-    support = retest.get("support_price") or breakout.get("support_price") or pullback.get("support_price")
-    invalid = retest.get("invalid_price") or breakout.get("invalid_price") or pullback.get("invalid_price")
-    breakout_level = retest.get("breakout_level") or breakout.get("breakout_level")
+    support, invalid, breakout_level = setup_reference_prices(setup_detail)
 
     final_quality = structure.get("vcp_quality", "D")
     if setup_signal in {"PULLBACK_BUY", "BREAKOUT_BUY", "RETEST_BUY"}:
@@ -2367,6 +2813,10 @@ def screen(df, code=None):
         "structure_conditions": structure.get("conditions", []),
         "structure_misses": structure.get("misses", []),
         "contraction_count": structure.get("contraction_count", 0),
+        "confirmed_contraction_count": structure.get("confirmed_contraction_count", 0),
+        "provisional_contraction_count": structure.get("provisional_contraction_count", 0),
+        "effective_contraction_count": structure.get("effective_contraction_count", 0),
+        "contraction_confirmation_status": structure.get("contraction_confirmation_status", "NONE"),
         "contraction_pcts": structure.get("contraction_pcts", ""),
         "contraction_days": structure.get("contraction_days", ""),
         "contraction_extension_tags": structure.get("contraction_extension_tags", []),
@@ -2386,8 +2836,12 @@ def screen(df, code=None):
         "post_breakout_state": structure.get("post_breakout_state", "PRE_BREAKOUT"),
         "post_breakout_failure": structure.get("post_breakout_failure"),
         "structure_breakout_date": (structure.get("breakout") or {}).get("date", ""),
+        "structure_breakout_score": structure_breakout_score,
         "structure_breakout_level": round_or_none((structure.get("breakout") or {}).get("level")),
         "breakout_days": structure.get("breakout_days"),
+        "prior_breakout_bonus_score": structure.get("prior_breakout_bonus_score"),
+        "prior_breakout_bonus_reasons": structure.get("prior_breakout_bonus_reasons", []),
+        "prior_breakout_context_tag": structure.get("prior_breakout_context_tag", ""),
         "vcp_quality": final_quality,
         "contractions": structure.get("contractions", []),
         "contraction_group": structure.get("contraction_group", []),
@@ -2408,16 +2862,20 @@ CSV_COLUMNS = [
     "setup_structure_base", "setup_action_score", "setup_current_action_score", "setup_breakout_action_score", "setup_score_components",
     "setup_reasons", "setup_misses", "setup_risk_flags", "setup_timing", "structure_volume_alignment",
     "structure_risk_flags", "support_price", "invalid_price", "breakout_level",
-    "contraction_count", "contraction_pcts", "contraction_days",
+    "contraction_count", "confirmed_contraction_count", "provisional_contraction_count",
+    "effective_contraction_count", "contraction_confirmation_status", "contraction_pcts", "contraction_days",
     "contraction_extension_tags", "contraction_extension_score", "contraction_extensions", "volume_pattern",
     "pivot_price", "structure_pivot", "market_pivot", "pivot_distance", "last_contraction_low",
     "structure_age_days", "structure_valid", "structure_invalid_reason",
-    "post_structure_gain", "post_structure_drawdown", "post_breakout_state", "structure_breakout_date", "structure_breakout_level", "breakout_days", "vcp_quality",
+    "post_structure_gain", "post_structure_drawdown", "post_breakout_state", "structure_breakout_date", "structure_breakout_score", "structure_breakout_level", "breakout_days",
+    "prior_breakout_bonus_score", "prior_breakout_bonus_reasons", "prior_breakout_context_tag", "vcp_quality",
     "close", "MA20", "MA60", "MA120", "MA20_slope", "MA60_slope",
     "range_10", "range_20", "range_60",
     "volume", "vol_ma5", "vol_ma20", "vol_ma60", "vol_ratio", "volume_dry_up",
     "distance_ma20", "distance_ma60", "distance_high_60",
-    "chg_5", "chg_20", "reason", "run_date", "strategy_version",
+    "chg_5", "chg_20", "price_mode", "adjustment_status", "factor_version",
+    "applied_action_count", "latest_corporate_action_date",
+    "reason", "run_date", "strategy_version",
 ]
 
 
@@ -2500,6 +2958,10 @@ def write_csv(results, quant_path):
                 r["invalid_price"] if r["invalid_price"] is not None else "",
                 r["breakout_level"] if r["breakout_level"] is not None else "",
                 r["contraction_count"],
+                r.get("confirmed_contraction_count", 0),
+                r.get("provisional_contraction_count", 0),
+                r.get("effective_contraction_count", r["contraction_count"]),
+                r.get("contraction_confirmation_status", "NONE"),
                 r["contraction_pcts"],
                 r["contraction_days"],
                 ";".join(r.get("contraction_extension_tags", [])),
@@ -2518,8 +2980,12 @@ def write_csv(results, quant_path):
                 r["post_structure_drawdown"] if r["post_structure_drawdown"] is not None else "",
                 r.get("post_breakout_state", ""),
                 r.get("structure_breakout_date", ""),
+                r["structure_breakout_score"] if r.get("structure_breakout_score") is not None else "",
                 r["structure_breakout_level"] if r.get("structure_breakout_level") is not None else "",
                 r["breakout_days"] if r.get("breakout_days") is not None else "",
+                r["prior_breakout_bonus_score"] if r.get("prior_breakout_bonus_score") is not None else "",
+                ";".join(r.get("prior_breakout_bonus_reasons", [])),
+                r.get("prior_breakout_context_tag", ""),
                 r["vcp_quality"],
                 r["close"] if r["close"] is not None else "",
                 r["MA20"] if r["MA20"] is not None else "",
@@ -2541,6 +3007,11 @@ def write_csv(results, quant_path):
                 r["distance_high_60"] if r["distance_high_60"] is not None else "",
                 r["chg_5"] if r["chg_5"] is not None else "",
                 r["chg_20"] if r["chg_20"] is not None else "",
+                r.get("price_mode", ""),
+                r.get("adjustment_status", ""),
+                r.get("factor_version", ""),
+                r.get("applied_action_count", 0),
+                r.get("latest_corporate_action_date") or "",
                 r["reason"],
                 r["run_date"],
                 r["strategy_version"],
@@ -2564,13 +3035,22 @@ def print_single_summary(result):
     print(f"触发: {result['setup_signal']} | model2_include={result['model2_include']}")
     print(f"买点质量: {result['setup_score']} / {result['setup_quality']} | 动作分 {result['setup_pattern_score']} | 加分 {result['setup_reasons']} | 扣分 {result['setup_misses']}")
     print(f"动作: {result['action_hint']} | 建议仓位 {result['suggested_position']}")
-    print(f"VCP: {result['structure_stage']} | 轮次 {result['contraction_count']} | 收缩 {result['contraction_pcts']} | 量能 {result['volume_pattern']}")
+    print(
+        f"VCP: {result['structure_stage']} | 轮次 {result['effective_contraction_count']}"
+        f"（{result['confirmed_contraction_count']}确认+{result['provisional_contraction_count']}候选）"
+        f" | 收缩 {result['contraction_pcts']} | 量能 {result['volume_pattern']}"
+    )
     print(f"扩展收缩: {result.get('contraction_extension_tags', [])} | 加分 {result.get('contraction_extension_score', 0)}")
     print(f"Pivot: {result['pivot_price']} | 距pivot {result['pivot_distance']}% | 年龄 {result['structure_age_days']}天 | 有效 {result['structure_valid']}")
     if result["structure_invalid_reason"]:
         print(f"结构失效: {result['structure_invalid_reason']} | 结构后涨幅 {result['post_structure_gain']}% | 回撤 {result['post_structure_drawdown']}%")
     print(f"质量 {result['vcp_quality']}")
     print(f"收盘: {result['close']} | MA20 {result['MA20']} | MA60 {result['MA60']}")
+    print(
+        f"价格口径: {result.get('price_mode')} | 复权核验 {result.get('adjustment_status')}"
+        f" | 已应用事件 {result.get('applied_action_count', 0)}"
+        f" | 最近除权日 {result.get('latest_corporate_action_date') or '-'}"
+    )
     print(f"距MA20: {result['distance_ma20']}% | 距MA60: {result['distance_ma60']}% | 距60日高点: {result['distance_high_60']}%")
     print(f"支撑: {result['support_price']} | 失效: {result['invalid_price']} | 突破位: {result['breakout_level']}")
     print(f"结论: {result['reason']}")
@@ -2716,9 +3196,19 @@ def process_codes(codes, today_yy, run_date, use_cache=True, allow_retry=True, p
         "cache_hits": 0,
         "api_calls": 0,
         "tdx_calls": 0,
+        "adjustment_no_action": 0,
+        "adjustment_verified": 0,
+        "adjustment_partial": 0,
+        "adjustment_pending": 0,
+        "adjustment_conflict": 0,
     }
     service = MarketDataService(MARKET_DATA_CONFIG)
-    frames, data_status = service.get_daily_bars(codes, run_date, max(200, BASE_CFG["min_runtime_data_days"]), force_refresh=not use_cache)
+    frames, data_status = service.get_daily_bars(
+        codes, run_date, max(200, BASE_CFG["min_runtime_data_days"]),
+        force_refresh=not use_cache,
+        price_mode=PRICE_ADJUSTMENT_CFG["mode"],
+        adjustment_config=PRICE_ADJUSTMENT_CFG,
+    )
     fatal_stop = False
     retry_queue = []
 
@@ -2732,6 +3222,10 @@ def process_codes(codes, today_yy, run_date, use_cache=True, allow_retry=True, p
 
         print(f"[{i+1}/{len(codes)}] {code} {name} ...", end=" ", flush=True)
         df, source = frames.get(code), data_status.get(code, {"source": "missing", "error": "数据库未返回数据", "retryable": False})
+        adjustment_status = str(source.get("adjustment_status") or "PENDING").lower()
+        stats_key = f"adjustment_{adjustment_status}"
+        if stats_key in stats:
+            stats[stats_key] += 1
         if df is None:
             if allow_retry and source["retryable"]:
                 print(f"失败: {source['error']}，加入重试队列")
@@ -2759,6 +3253,13 @@ def process_codes(codes, today_yy, run_date, use_cache=True, allow_retry=True, p
         stats["pull_ok"] += 1
         df = calc_indicators(df)
         result = result_from_df(code, name, df, run_date)
+        result.update({
+            "price_mode": source.get("price_mode", PRICE_ADJUSTMENT_CFG["mode"]),
+            "adjustment_status": source.get("adjustment_status", "PENDING"),
+            "factor_version": source.get("factor_version", PRICE_ADJUSTMENT_CFG["factor_version"]),
+            "applied_action_count": int(source.get("applied_action_count", 0)),
+            "latest_corporate_action_date": source.get("latest_corporate_action_date"),
+        })
         results.append(result)
         print(f"{result['structure_stage']} / {result['setup_signal']} | score={result['structure_score']} | {result['reason'][:48]}")
         _write_quant_progress(
@@ -2842,6 +3343,10 @@ def main():
             "schema": "quant_vcp_structure_v2",
             "strategy_version": STRATEGY_VERSION,
             "strategy_file": f"strategies/{QUANT_STRATEGY_FILE}",
+            "price_mode": PRICE_ADJUSTMENT_CFG["mode"],
+            "adjustment_factor_version": PRICE_ADJUSTMENT_CFG["factor_version"],
+            "corporate_action_source": PRICE_ADJUSTMENT_CFG["primary_source"],
+            "adjustment_verification_source": PRICE_ADJUSTMENT_CFG["verification_source"],
         },
         "stats": stats,
         "llm": llm_payload,

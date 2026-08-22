@@ -1,7 +1,7 @@
 # 模型二：量价精筛模型（自执行指令）
 
 - **版本管理**: 由 Git 分支与提交历史管理，文件名不再携带版本号
-- **最近更新**: 2026-08-14（model2_quant_v17）
+- **最近更新**: 2026-08-22（model2_quant_v26）
 - **核心目标**: 在模型一基本面候选池中，寻找 VCP 蓄力结构和可交易触发，输出可复现、可回测、可供模型三/四复用的结构化量价结果。
 - **核心哲学**: 基本面先过滤烂公司，模型二只判断资金行为和价格位置。脚本负责确定性计算，LLM 只做可选解释，不参与结构阶段或交易触发判定。
 - **输入**: `pool/pool_<YYMMDD>.csv`，或命令行指定 `--code/--codes`
@@ -122,6 +122,8 @@ VCP 结构观察的交易含义：
 
 > **收缩幅度测量口径**（model2_quant_v8 起）：VCP 收缩的转折点与振幅都使用**收盘价 Swing**。每轮回调从收盘价局部高点到后续收盘价局部低点计算：`close_pullback_pct = (end_close - start_close) / start_close`，且必须 `end_close < start_close`。日内最高/最低价不参与收缩轮次、递减判定或收盘修复；它们只用于 Pivot、失效位和影线风险审计。这样收缩的定位与测量口径一致，排除影线造成的伪收缩。
 
+> **最右端候选收缩**（model2_quant_v23 起）：历史区间继续使用左右各 3 个交易日确认的收盘价 Swing；当最新低点右侧不足 3 个交易日时，只要起点满足左侧 Swing High、当前低点是该段最低收盘，且幅度、持续时间等标准收缩条件成立，就先以 `PROVISIONAL` 计入当前有效轮次和实时结构阶段。输出同时区分 `confirmed_contraction_count`、`provisional_contraction_count` 与 `effective_contraction_count`，并记录 `right_confirm_days / required_right_confirm_days`。后续出现更低收盘时，候选轮次向后延伸并重算；违反收缩阈值或结构约束时移除；右侧满 3 个交易日且低点未被刷新后自动升级为 `CONFIRMED`。历史回测审计可用确认数，实时观察与阶段判断使用有效数，禁止把候选状态伪装成已确认事实。
+
 若同一收缩段的日内振幅比收盘振幅大 8pct 以上，标记 `INTRADAY_CLOSE_DIVERGENCE`：保留收盘结构，但降低买点评分并提示人工复核。
 
 ### PULLBACK_BUY：结构内缩量回踩低吸
@@ -137,6 +139,16 @@ VCP 结构已经成立
 ```
 
 `PULLBACK_BUY` 买的是风险收益比。价格较低，失效位清楚，但突破尚未确认，确定性低于 `RETEST_BUY`。
+
+强势突破后新 VCP 例外：若旧 VCP 已被确认突破消耗、当前新 VCP 的全部收缩均发生在突破后，且前序突破附加参考有效，则允许一轮收缩的 `VCP_EARLY` 进入 `PULLBACK_BUY` 判断。该例外不改变普通 `VCP_EARLY`，并必须同时满足：
+
+- 前序突破仍处于 HOT / RETEST / CONSOLIDATING，未失败、未过期；
+- 前序突破冻结结构分不低于策略门槛；
+- 当前新 VCP 至少一轮有效收缩，`volume_pattern in {decreasing, drying}`；
+- 当前新结构低点高于旧 Pivot 的失效线；
+- 继续满足原 PULLBACK 的缩量、最近收缩低点、均线斜率和风险硬条件；位置允许使用 MA20 / MA60，或当前新收缩低点形成的收敛下沿。使用新收缩低点时必须先站上确认缓冲，计划价格区不得与该确认价冲突。
+
+它仍属于新 VCP 的 `PULLBACK_BUY`，旧 VCP 只作为附加参考；不得改写为 `RETEST_BUY`，也不得把旧收缩轮次重新计入当前结构。
 
 仓位建议：
 
@@ -210,11 +222,31 @@ SQLite 日线库 → 缺口检测与补数 → 通达信 TDX/mootdx → 妙想 A
 
 统一数据服务先按 `run_date` 从 `cache/market_data/market_data.sqlite` 读取所需窗口；仅当目标日缺失或历史不足时补取。主源失败、返回空数据或未覆盖目标日时，才使用妙想 API 备用源；两者均标准化为 OHLCV 后写回数据库并记录来源。
 
+`daily_bars` 永远保存数据源返回的原始不复权 OHLCV，不允许用复权结果覆盖。模型二读取窗口后，必须另外同步通达信 `xdxr` 公司行为记录，并只使用 `除权日 <= run_date` 的事件实时计算时点前复权价格。前复权只变换 OHLC，成交量和成交额保持原始口径；市场状态等未显式申请复权的消费者继续读取原始价格。
+
+公司行为与核验结果分别写入 `corporate_actions`、`adjustment_verifications`，不得改写 `daily_bars`。同一股票同一 `run_date` 的通达信记录只同步一次；新发现或内容变化、且会影响当前模型窗口的事件才触发 BaoStock 核验。核验只抽取除权日前一交易日、除权日及已有时的后一交易日，比较归一化复权因子，并同时检查 BaoStock 原始收盘价与本地原始收盘价。由于不同数据源的前复权锚点可能不同，不得直接比较两端绝对前复权价。
+
+免费源对送转与极小额现金分红的复权因子可能存在交易所舍入差异：归一化因子相对误差不超过 `1%`、原始收盘价误差不超过 `0.15%` 视为通过；超过任一阈值才记为 `CONFLICT`。阈值调整时允许根据已保存的误差重新分类，不重复请求核验源。
+
+免费核验适配器依赖 `baostock`（项目虚拟环境执行 `.venv/bin/pip install baostock`）。依赖缺失或服务暂时不可用时记录 `PENDING`，不得回写或伪造核验成功。
+
+复权状态口径：
+
+```text
+NO_ACTION  当前窗口无公司行为
+VERIFIED   当前窗口应用的事件均已通过 BaoStock 抽样核验
+PENDING    通达信事件已应用，但免费核验源暂不可用或尚待核验
+PARTIAL    只核验了当前批次最新事件，窗口内仍有历史事件未核验
+CONFLICT   复权因子或原始价格超出容差；该标的本轮不得进入模型计算
+```
+
+输出必须记录 `price_mode=point_in_time_qfq`、复权状态、因子版本、已应用事件数和最近除权日。复盘历史日期时不得使用该日期之后的公司行为，避免未来信息污染。
+
 模型二必须把本次 `run_date` 传入统一数据服务。未指定 `--date` 时，`run_date` 由共享数据层按 15:00 分隔线确定：15:00 前取前一交易日，15:00 后取当日，周末回退到周五。指定 `--date` 时，数据库覆盖校验、缺口补数和回源后数据截断都以该指定交易日为准。
 
 通达信 mootdx 是主数据源；当通达信限流、返回空数据、结构异常、异常抛出或未覆盖目标交易日时，脚本才尝试妙想 API。若本地未配置 `MX_APIKEY`，则通达信失败会直接返回取数失败。通达信数据统一写入 SQLite；模型二判定不得依赖 `turnover`。
 
-数据库只保存原始日线，不保存指标列；指标每次实时计算，避免规则变更后旧指标污染。数据库命中必须同时满足：
+数据库只保存原始日线和独立公司行为记录，不保存复权日线或指标列；复权价格与指标每次实时计算，避免锚点或规则变化后旧结果污染。数据库命中必须同时满足：
 
 ```text
 文件名日期 = 当前运行日期；或运行日缓存未命中时，为该股票不晚于运行日的最近可用缓存
@@ -396,6 +428,7 @@ PULLBACK_BUY
 - 结构内缩量回踩买点。
 - 前提阶段：VCP_FORMING / VCP_MATURE / VCP_TIGHT。
 - 硬条件：回踩 MA20 / MA60 / 收敛下沿，具备基础缩量，最近收缩低点不破，MA20 斜率未明显走坏，无放量长上影，无趋势硬风险。
+- 最近收缩低点的企稳确认必须使用该收缩低点日的收盘价 `end_close`：最新收盘需高于 `end_close × 1.02`。不得使用日内最低价 `low_price` 作为企稳确认锚点，避免最右端候选收缩在低点形成当天用自身下影线完成自我确认。`low_price` 继续用于盘中破位与失效价风险边界。
 - 评分项：买点类型基础分、回踩位置、缩量质量、前低确认。
 - 缩量确认：`volume_dry_up < 0.80`，或收缩段均量逐轮递减且当前 1-3 日量能仍处于最近收缩段低量区。单日地量只能作为确认，不得单独触发买点。
 - 交易含义：低吸试探，风险收益比优先，确定性低于 RETEST_BUY。
@@ -562,14 +595,18 @@ pullback_pct（兼容字段，等同于 close_pullback_pct）
 duration_days
 avg_volume
 recovery_pct
+confirmation_status（CONFIRMED / PROVISIONAL）
+right_confirm_days / required_right_confirm_days
 ```
 
 `duration_days = low_idx - high_idx + 1`，与 `avg_volume` 的取样区间一致，均包含局部高点日和局部低点日。
 
 ### 1.1.1 扩展收缩类型
 
-标准 contraction 继续是结构骨架，只有标准 contraction 参与 `contraction_count`、收缩递减和
-`VCP_EARLY / VCP_FORMING / VCP_MATURE / VCP_TIGHT` 阶段判定。模型二在标准结构之外识别两类
+标准 contraction 继续是结构骨架；已确认与最右端候选标准 contraction 都参与实时
+`effective_contraction_count`（兼容字段 `contraction_count`）、收缩递减和
+`VCP_EARLY / VCP_FORMING / VCP_MATURE / VCP_TIGHT` 阶段判定，历史审计使用
+`confirmed_contraction_count`。模型二在标准结构之外识别两类
 扩展收缩，用于评价同阶段结构的供求质量：
 
 | 类型 | 成立条件 | 用途 |
@@ -634,6 +671,8 @@ abs(Cn.pullback) <= abs(Cn-1.pullback) * 1.05
 
 原 VCP 的 `price_breakout` 发生在最后一轮收缩后，收盘价首次站上 `structure_pivot × 1.01`。突破并不立即删除原结构：它仍用于记录完整的“收缩 → 突破 → 跟随/回踩”质量，但买点权限转入突破后状态管理。
 
+突破生命周期必须同时冻结 `structure_breakout_score`：使用突破日前最后一个交易日可见数据，对本次突破所对应的原 VCP 按既有 `structure_score` 规则评分。该值与 BREAKOUT/RETEST 的 `setup_structure_score` 使用同一突破前时间锚点；突破后不得随当日重新扫描出的结构阶段、位置或量能变化而改写。若历史数据无法重建该锚点则留空，不得用当日 `structure_score` 冒充。
+
 | post_breakout_state | 含义 | 买点权限 |
 |---|---|---|
 | `PRE_BREAKOUT` | 尚未发生价格突破 | PULLBACK / BREAKOUT |
@@ -644,6 +683,24 @@ abs(Cn.pullback) <= abs(Cn-1.pullback) * 1.05
 | `POST_BREAKOUT_EXPIRED` | 突破后超过 20 日，旧买点窗口结束 | WAIT_REBUILD |
 
 硬边界：一旦进入任何 `POST_BREAKOUT_*` 状态，原 `contraction_group` 永久禁止 `PULLBACK_BUY` 与重复 `BREAKOUT_BUY`。`POST_BREAKOUT_FAILED` 由突破日至当前日的完整路径判定，不是当日状态：命中任一失效事件后不可因后续反弹恢复为 `RETEST` 或重新成为 `VCP_FORMING`。当状态失败或过期后，旧结构仅保留审计；之后必须从失效日后开始形成新的 contraction group，才能重新产生 PULLBACK / BREAKOUT。
+
+候选组还必须遵守突破消耗边界：若候选组的至少两轮前缀已经在后一轮收缩开始前确认 `price_breakout`，该前缀已被突破消耗，候选组不得再把突破后的收缩拼回旧 VCP。价格突破边界只使用旧组冻结的 `structure_pivot`，以收盘首次站上 `structure_pivot × 1.01` 定位；即使旧组趋势资格不足，该边界仍负责切断前后收缩，避免后验行情把下降趋势中的旧波动拼入新 VCP。
+
+“价格突破边界”不自动等于“有效 VCP 突破”。只有使用突破日前最后一个交易日的数据重新运行完整 VCP 判定，并且满足 `has_structure=true`、阶段至少为 `VCP_FORMING`、当前有效组与产生旧 Pivot 的组一致，才允许把该事件作为前序 VCP 上下文。突破前状态为 `REJECT/NONE`、趋势基础不足、仅为 `VCP_EARLY` 或无法重建同一结构组时，只保留切分边界，不得进入突破后 VCP 生命周期、附加分或专用回踩计划。不得使用突破日之后的数据反向改善前序结构资格。
+
+通过上述资格后，突破后的收缩从新结构重新计数；旧 VCP 继续按原 Pivot 负责 `RETEST_BUY`，新 VCP 独立负责后续 `PULLBACK_BUY` / `BREAKOUT_BUY`，两条路径不得混用收缩轮次。
+
+若当前新 VCP 形成于一轮仍未失败的强势突破整理中，输出前序突破附加参考：
+
+- `prior_breakout_bonus_score`：前序 VCP 突破日前冻结的 `structure_score`；仅展示，不累加进当前 `structure_score`，也不参与阶段或买点硬条件。
+- `prior_breakout_bonus_reasons`：附加参考成立原因，至少说明前序突破日期、原 Pivot 和“突破后强势整理形成新 VCP”。
+- `prior_breakout_context_tag`：有效前序 VCP 突破固定为“之前已有突破并强势整理”；若仅命中下述放量启动上下文则使用“放量启动后强势整理”，供页面按需展示。
+
+前序突破必须来自至少两轮有效收缩，发生在当前新 VCP 第一轮开始前，且截至当前仍处于 `POST_BREAKOUT_HOT`、`POST_BREAKOUT_RETEST` 或 `POST_BREAKOUT_CONSOLIDATING`。失败、过期、无法重建突破前结构分或当前结构仍混用旧收缩时，均不得生成附加参考。
+
+若旧组不具备有效 VCP 突破资格，但当前有效 VCP 之前出现明确的放量启动，随后保持小幅回撤、显著缩量并形成当前收缩，则复用既有附加信息字段输出 `prior_breakout_context_tag=放量启动后强势整理`。该标签只提高机会辨识度：`prior_breakout_bonus_score` 必须为空，不得恢复旧结构分，不得进入旧 Pivot 的 `RETEST_BUY` 或强势突破后单轮 VCP 专用 `PULLBACK_BUY`。
+
+放量启动上下文使用当前 VCP 第一轮起点之前的既有量价数据判定：近 10 个交易日从最低收盘到峰值收盘至少上涨 12%，峰值成交量至少为此前 20 日均量的 1.5 倍；峰值位于当前收缩起点附近，当前收盘较启动后最高价回撤不超过 12%，当前成交量较启动峰值至少缩减 45%，当前收缩的收盘回撤不超过 12%，且量能状态为 `drying/decreasing`。所有条件均只用于附加说明，不改变当前结构阶段、结构分和买点权限。
 
 相邻收缩轮次允许轻微扩张，但明显扩张会打断旧 VCP 组，后一轮应视为新结构的起点：
 
@@ -734,7 +791,7 @@ vol_ma20 < vol_ma60
 
 ### PULLBACK_BUY：结构内缩量回踩
 
-必须先有 `VCP_FORMING`、`VCP_MATURE` 或 `VCP_TIGHT`，`VCP_EARLY` 只观察，不触发 `PULLBACK_BUY`。
+必须先有 `VCP_FORMING`、`VCP_MATURE` 或 `VCP_TIGHT`。普通 `VCP_EARLY` 只观察；仅满足“强势突破后新 VCP”专用门槛时允许进入 `PULLBACK_BUY` 判断。
 
 且 `post_breakout_state = PRE_BREAKOUT`。已经突破的旧 VCP 即使价格回到 MA20 或旧 Pivot 附近，也不得重新触发 PULLBACK。
 
@@ -742,7 +799,7 @@ vol_ma20 < vol_ma60
 volume_dry_up < 0.80
 或：收缩段 avg_volume 逐轮下降，且最近 1-3 日均量 <= 最近收缩段 avg_volume × 1.10
 distance_ma20 在 [-4%, +3%]，或 distance_ma60 在 [-5%, +5%]
-close > 最近一轮 contraction low × 1.02
+close > 最近一轮 contraction end_close × 1.02
 MA20_slope >= -0.03%/日
 无放量长阴
 setup_score >= 55
@@ -1062,6 +1119,7 @@ suggested_position
 model2_include
 
 structure_score
+structure_breakout_score
 structure_risk_score
 structure_risk_flags
 setup_pattern_score
@@ -1074,6 +1132,10 @@ support_price
 invalid_price
 breakout_level
 contraction_count
+confirmed_contraction_count
+provisional_contraction_count
+effective_contraction_count
+contraction_confirmation_status
 contraction_pcts
 contraction_days
 contraction_extension_tags
@@ -1105,6 +1167,8 @@ reason
 run_date
 strategy_version
 ```
+
+顶层 `support_price`、`invalid_price`、`breakout_level` 只描述当前最终 `setup_signal` 对应的买点；必须从选中的 `setup_detail` 读取，不得按 RETEST / BREAKOUT / PULLBACK 候选的固定优先级跨类型借值。`setup_signal=NONE` 时不输出其他候选买点的价格；RETEST 卖压硬阻断可保留其自身价格供失败原因审计。
 
 `setup_plan_inputs` 为模型四 Signal Plan 使用的结构化中间阈值，不参与模型二自身排序和买点判定。模型二必须先按原逻辑完成 `setup_signal` 与 `setup_score` 判定，再把判定过程中已经计算出的阈值透出：
 
