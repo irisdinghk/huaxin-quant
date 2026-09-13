@@ -552,7 +552,7 @@ def main():
         tracker.step_done("ai_daily_report", error=f"exit {result.returncode}")
         stop_after("AI研读数据包")
     tracker.step_done("ai_daily_report")
-    print("[daily] ✓ AI daily report done")
+    print("[daily] [OK] AI daily report done")
 
     # ── Step 10: Verify all date-scoped outputs ──
     tracker.step_start("verify")
