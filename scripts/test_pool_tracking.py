@@ -6,6 +6,7 @@ from scripts.data.pool_tracking import (
     GRACE,
     STRUCTURE,
     finalize_tracking_rows,
+    has_active_structure,
     prepare_tracking_rows,
 )
 
@@ -130,6 +131,73 @@ class PoolTrackingTests(unittest.TestCase):
         )[0]
         self.assertEqual(row["tracking_status"], STRUCTURE)
         self.assertEqual(row["tracking_source"], "BLOOM_BOOTSTRAP")
+
+    def test_liquidity_exemption_requires_active_structure_evidence(self):
+        for stage in ["VCP_EARLY", "VCP_FORMING", "VCP_MATURE", "VCP_TIGHT"]:
+            with self.subTest(stage=stage):
+                self.assertTrue(has_active_structure({
+                    "tracking_status": STRUCTURE, "quant_stage": stage,
+                    "bloom_status": "FORMING", "post_breakout_state": "PRE_BREAKOUT",
+                }))
+        for post in ["POST_BREAKOUT_HOT", "POST_BREAKOUT_RETEST", "POST_BREAKOUT_CONSOLIDATING"]:
+            with self.subTest(post=post):
+                self.assertTrue(has_active_structure({
+                    "tracking_status": STRUCTURE, "quant_stage": "NONE",
+                    "bloom_status": "COOLDOWN", "post_breakout_state": post,
+                }))
+        self.assertTrue(has_active_structure({"model2_stage": "VCP_FORMING", "bloom_status": "FORMING"}))
+        self.assertTrue(has_active_structure({"quant_stage": "VCP_FORMING", "bloom_status": "RISK_BLOCKED"}))
+        rejected = [
+            {"tracking_status": STRUCTURE},
+            {"quant_stage": "TREND_WATCH", "bloom_status": "INVALID"},
+            {"quant_stage": "TREND_REBUILD", "bloom_status": "INVALID"},
+            {"tracking_status": GRACE, "quant_stage": "VCP_FORMING"},
+            {"tracking_status": EXITED, "quant_stage": "VCP_FORMING"},
+            {"quant_stage": "VCP_FORMING", "structure_valid": False},
+            {"quant_stage": "VCP_FORMING", "bloom_status": "EXIT"},
+            {"quant_stage": "VCP_FORMING", "post_breakout_state": "POST_BREAKOUT_FAILED"},
+            {"quant_stage": "VCP_FORMING", "post_breakout_state": "POST_BREAKOUT_EXPIRED"},
+            {"quant_stage": "DATA_ISSUE", "bloom_status": "DATA_ISSUE"},
+        ]
+        for state in rejected:
+            with self.subTest(state=state):
+                self.assertFalse(has_active_structure(state))
+
+    def test_structure_exemption_survives_data_issue_and_ends_after_failure(self):
+        prior = {"000001": {
+            "tracking_status": STRUCTURE, "quant_stage": "VCP_FORMING",
+            "bloom_status": "FORMING", "first_seen_date": "2026-01-01",
+        }}
+        pending = prepare_tracking_rows(
+            "2026-01-02", [{**self.candidate(), "liquidity_filter_exempt": True}],
+            prior, ["2026-01-01", "2026-01-02"], 20,
+        )
+        frozen = finalize_tracking_rows(
+            "2026-01-02", pending, {"000001": {"structure_stage": "DATA_ISSUE"}},
+            {"000001": {"bloom_status": "DATA_ISSUE"}}, 20,
+        )[0]
+        self.assertTrue(has_active_structure(frozen))
+        self.assertTrue(frozen["liquidity_filter_exempt"])
+        pending_again = prepare_tracking_rows(
+            "2026-01-03", [self.candidate()], {"000001": frozen},
+            ["2026-01-01", "2026-01-02", "2026-01-03"], 20,
+        )
+        frozen_again = finalize_tracking_rows(
+            "2026-01-03", pending_again, {"000001": {"structure_stage": "DATA_ISSUE"}},
+            {"000001": {"bloom_status": "DATA_ISSUE"}}, 20,
+        )[0]
+        self.assertTrue(has_active_structure(frozen_again))
+        failed = finalize_tracking_rows(
+            "2026-01-02", pending, {},
+            {"000001": {"bloom_status": "EXIT", "post_breakout_state": "POST_BREAKOUT_FAILED"}}, 20,
+        )[0]
+        self.assertEqual(failed["tracking_status"], GRACE)
+        self.assertFalse(has_active_structure(failed))
+        next_day = prepare_tracking_rows(
+            "2026-01-03", [self.candidate(reason="LOW_LIQUIDITY")],
+            {"000001": failed}, ["2026-01-01", "2026-01-02", "2026-01-03"], 20,
+        )[0]
+        self.assertEqual(next_day["exit_reason"], "HARD_FILTER:LOW_LIQUIDITY")
 
 
 if __name__ == "__main__":
