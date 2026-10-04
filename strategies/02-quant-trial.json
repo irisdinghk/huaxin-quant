@@ -1,0 +1,37 @@
+{
+  "strategy_version": "quant_impulse_score_research_v1",
+  "research_only": true,
+  "budget": {
+    "structure": 40,
+    "volume": 20,
+    "impulse": 30,
+    "trend": 5,
+    "position": 5,
+    "extension": 12
+  },
+  "legacy_caps": {
+    "structure": 55,
+    "volume": 30,
+    "trend": 15,
+    "position": 22
+  },
+  "quality_weights": {
+    "gain_pct": 0.4,
+    "up_volume_ratio": 0.2,
+    "up_down_volume_ratio": 0.2,
+    "path_efficiency": 0.15,
+    "speed_pct": 0.05
+  },
+  "calibration": {
+    "quantile": 0.9,
+    "min_samples": 20,
+    "floors": {
+      "gain_pct": 0,
+      "up_volume_ratio": 1,
+      "up_down_volume_ratio": 1,
+      "speed_pct": 0
+    }
+  },
+  "baseline_volume_days": 20,
+  "setup_conversion": "normalize_112_to_100"
+}
