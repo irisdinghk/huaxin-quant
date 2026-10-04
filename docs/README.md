@@ -9,7 +9,8 @@
 | 项目介绍与独立安装 | [README](../README.md)、[English](../README.en.md) |
 | 架构、模块依赖和权威数据 | [DESIGN](../DESIGN.md) |
 | 每日执行、估值恢复、异常处理 | [WORKFLOW](../WORKFLOW.md) |
-| Agent 工程规范 | [AGENTS](../AGENTS.md)、[CLAUDE](../CLAUDE.md) |
+| Agent 工程、投研与数据使用规范 | [共用规范 AGENTS](../AGENTS.md)、[Claude 入口](../CLAUDE.md) |
+| 盘后人工机会初筛 | [机会初筛指令](../instructions/opportunity-screening.md) |
 | 策略理解 | [策略阅读指南](../instructions/trading-strategy.md) |
 | 开发任务与验收方案 | [TODO](../TODO.md)、[改进路线图](IMPROVEMENT_ROADMAP.md) |
 | 公开截图与脱敏 | [截图说明](SCREENSHOT_PLAN.md) |
@@ -27,7 +28,9 @@
 
 ## 内容职责
 
+- AGENTS 保存跨任务的共同约束和任务导航；CLAUDE 引导读取 AGENTS，不维护第二套规则。模块命令放 WORKFLOW 或对应指令卡，目录与实现边界放 DESIGN，入口不重复列举。
 - 主指令卡保存当前流程、规则和约束；配对 ref 保存按需查阅的字段、公式和内部接口。
+- 模型主指令卡保持固定文件名：`01-pool.md`、`02-quant.md`、`03-valuation.md`、`03-valuation-ref.md`、`04-tracker.md`；内部信号模块使用 `signal-` 前缀。
 - 架构与 README 不复制细颗粒阈值；TODO 保存任务状态，不作为运行时策略。
 - 模型三历史协议见 [legacy reference](../instructions/03-valuation-legacy-ref.md)，仅用于旧运行包审计；当前分析遵循 V4。
 - 修改文档时区分“实现现状”“历史口径”“待实现方案”。发现文档与代码不一致，应校正描述或单独提出规则修改，不在文档整理中静默改变业务规则。
