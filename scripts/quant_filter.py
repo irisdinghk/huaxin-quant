@@ -49,6 +49,7 @@ from scripts.shared import PROJECT_ROOT, VALUATION_INDEX_PATH, expected_trade_da
 from scripts.data.market_data_service import MarketDataService
 from scripts.data.strategy_data_store import connect as connect_strategy_db, load_document, save_quant
 from scripts.strategy_config import load_strategy_config
+from scripts.impulse_evidence import analyze_impulse_evidence, empty_impulse_evidence
 
 
 # ===================== 配置 =====================
@@ -66,6 +67,7 @@ POST_BREAKOUT_CFG = VCP_CFG["post_breakout"]
 POST_GROUP_RESET_CFG = VCP_CFG["post_group_reset"]
 DESTRUCTIVE_RESET_CFG = VCP_CFG.get("destructive_reset", {})
 STRONG_IMPULSE_CONTEXT_CFG = VCP_CFG.get("strong_impulse_context", {})
+IMPULSE_EVIDENCE_CFG = VCP_CFG.get("impulse_evidence", {})
 POST_FAILURE_REBUILD_WATCH_CFG = POST_BREAKOUT_CFG.get("post_failure_rebuild_watch", {})
 BASE_CFG = QUANT_STRATEGY["base_rules"]
 CONTRACTION_CFG = QUANT_STRATEGY["contraction_rules"]
@@ -3463,6 +3465,7 @@ def screen(df, code=None):
             "prior_breakout_bonus_reasons": [],
             "prior_breakout_context_tag": "",
             "vcp_quality": "D",
+            "impulse_evidence": empty_impulse_evidence("DATA_ISSUE", ["MA20_UNAVAILABLE"]),
             "contractions": [],
             "contraction_group": [],
             "destructive_reset": None,
@@ -3570,6 +3573,7 @@ def screen(df, code=None):
         "prior_breakout_bonus_reasons": structure.get("prior_breakout_bonus_reasons", []),
         "prior_breakout_context_tag": structure.get("prior_breakout_context_tag", ""),
         "vcp_quality": final_quality,
+        "impulse_evidence": analyze_impulse_evidence(df, structure, IMPULSE_EVIDENCE_CFG),
         "contractions": structure.get("contractions", []),
         "contraction_group": structure.get("contraction_group", []),
         "destructive_reset": structure.get("destructive_reset"),
@@ -3611,7 +3615,7 @@ CSV_COLUMNS = [
     "distance_ma20", "distance_ma60", "distance_high_60",
     "chg_5", "chg_20", "price_mode", "adjustment_status", "factor_version",
     "applied_action_count", "latest_corporate_action_date",
-    "reason", "run_date", "strategy_version",
+    "reason", "run_date", "strategy_version", "impulse_evidence",
 ]
 
 
@@ -3751,6 +3755,7 @@ def write_csv(results, quant_path):
                 r["reason"],
                 r["run_date"],
                 r["strategy_version"],
+                json.dumps(r.get("impulse_evidence", {}), ensure_ascii=False, separators=(",", ":")),
             ])
     print(f"\n精选池已输出: {quant_path}")
 
