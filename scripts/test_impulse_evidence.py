@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts import quant_filter as quant
 from scripts.impulse_evidence import analyze_impulse_evidence
 from scripts.data.strategy_data_store import connect, load_document, save_quant
+from scripts.audit_impulse_evidence import _extension_core, _research_comparison
 
 
 def frame(closes):
@@ -35,6 +36,7 @@ def structure(df, start, end):
             "start_date": str(df.iloc[start]["date"]), "end_date": str(df.iloc[end]["date"]),
             "close_pullback_pct": (df.iloc[end]["close"] / df.iloc[start]["close"] - 1) * 100,
             "confirmation_status": "CONFIRMED",
+            "required_right_confirm_days": 0,
         }],
     }
 
@@ -53,7 +55,7 @@ class ImpulseEvidenceTests(unittest.TestCase):
         self.assertEqual(selected["anchor"]["base_idx"], 28)
         self.assertEqual(selected["anchor"]["peak_idx"], 31)
         self.assertAlmostEqual(selected["price"]["gain_pct"], (115 / 90 - 1) * 100, places=5)
-        self.assertLess(selected["strongest_unlinked_candidate"]["bridge_drawdown_pct"], -12)
+        self.assertLess(selected["strongest_exhausted_candidate"]["bridge_drawdown_pct"], -12)
 
     def test_platform_pause_does_not_require_peak_within_two_days(self):
         df = frame([100.0] * 25 + [105, 115, 130, 128, 126, 129, 127, 123, 122])
@@ -129,13 +131,143 @@ class ImpulseEvidenceTests(unittest.TestCase):
         df = frame([100.0] * 25 + [99, 98, 97, 96])
         self.assertEqual(self.analyze(df, 27, 28)["status"], "NO_ADVANCE")
 
-    def test_disconnected_old_advance_is_retained_as_unlinked_evidence(self):
+    def test_fully_retraced_old_advance_is_retained_as_exhausted_evidence(self):
         df = frame([100.0] * 25 + [110, 130, 125, 105, 95, 90, 85, 87])
         selected = self.analyze(df, 30, 32)["selected"]
-        self.assertEqual(selected["status"], "UNLINKED")
+        self.assertEqual(selected["status"], "EXHAUSTED")
         self.assertEqual(selected["linked_candidate_count"], 0)
-        self.assertIn("PLATFORM_LINK_BROKEN", selected["reasons"])
+        self.assertIn("ADVANCE_FULLY_RETRACED_BEFORE_GROUP", selected["reasons"])
         self.assertEqual(selected["price"]["gain_pct"], 30)
+
+    def test_deeper_than_twelve_percent_keeps_substantial_impulse_over_small_bounce(self):
+        df = frame([22.15] * 25 + [24, 27, 30.18, 26.35, 26.92, 29.30, 27.81, 26.18])
+        selected = self.analyze(df, 31, 32)["selected"]
+        self.assertEqual(selected["anchor"]["peak_idx"], 27)
+        self.assertAlmostEqual(selected["price"]["gain_pct"], 36.252822, places=5)
+        self.assertLess(selected["price"]["bridge_drawdown_pct"], -12)
+        self.assertEqual(selected["status"], "IDENTIFIED")
+        self.assertEqual(len(selected["episodes"]), 1)
+        self.assertEqual(selected["latest_weak_candidate"]["base_date"], str(df.iloc[28]["date"]))
+        self.assertEqual(selected["latest_weak_candidate"]["peak_date"], str(df.iloc[30]["date"]))
+
+    def test_latest_substantial_leg_does_not_always_select_largest_old_gain(self):
+        df = frame([100.0] * 25 + [160, 120, 130, 145, 140, 135])
+        selected = self.analyze(df, 29, 30)["selected"]
+        self.assertEqual(selected["anchor"]["base_idx"], 26)
+        self.assertEqual(selected["anchor"]["peak_idx"], 28)
+        self.assertAlmostEqual(selected["price"]["gain_pct"], (145 / 120 - 1) * 100, places=5)
+
+    def test_rebuild_separates_rounds_and_preserves_old_failure(self):
+        df = frame([100.0] * 25 + [110, 120, 130, 115, 90, 95, 105, 120, 114, 110, 125])
+        value = structure(df, 27, 29)
+        value["contraction_group"] += structure(df, 32, 34)["contraction_group"]
+        before = copy.deepcopy(value)
+        evidence = analyze_impulse_evidence(df, value, self.cfg)
+        first, second = evidence["selected"]["episodes"]
+        self.assertEqual(first["group_round_numbers"], [1])
+        self.assertEqual(second["group_round_numbers"], [2])
+        self.assertEqual(first["lifecycle"], "EXHAUSTED")
+        self.assertEqual(first["exhaustion"]["end_idx"], 29)
+        self.assertEqual(second["anchor"]["base_idx"], 29)
+        self.assertEqual(second["anchor"]["peak_idx"], 32)
+        self.assertLess(first["retention"]["post_peak"]["close_retention_pct"], 0)
+        self.assertAlmostEqual(second["retention"]["rounds"][0]["close_retention_pct"], 200 / 3, places=5)
+        self.assertEqual(second["retention"]["rounds"][0]["round"], 2)
+        self.assertEqual(evidence["group_start_date"], str(df.iloc[32]["date"]))
+        self.assertEqual(evidence["original_group_start_date"], str(df.iloc[27]["date"]))
+        self.assertEqual(value, before)
+
+    def test_rebuild_waits_for_original_right_confirmation(self):
+        df = frame([100.0] * 25 + [110, 120, 130, 115, 90, 115, 105, 103, 101, 120, 115])
+        value = structure(df, 27, 29)
+        value["contraction_group"][0]["required_right_confirm_days"] = 3
+        value["contraction_group"] += structure(df, 30, 33)["contraction_group"]
+        evidence = analyze_impulse_evidence(df, value, self.cfg)
+        self.assertEqual(len(evidence["selected"]["episodes"]), 1)
+        self.assertEqual(evidence["selected"]["exhaustion"]["confirmed_idx"], 32)
+        value["contraction_group"] += structure(df, 34, 35)["contraction_group"]
+        self.assertEqual(len(analyze_impulse_evidence(df, value, self.cfg)["selected"]["episodes"]), 2)
+
+    def test_missing_confirmation_timing_does_not_backdate_rebuild(self):
+        df = frame([100.0] * 25 + [110, 120, 130, 115, 90, 95, 105, 120, 114, 110])
+        value = structure(df, 27, 29)
+        value["contraction_group"][0].pop("required_right_confirm_days")
+        value["contraction_group"] += structure(df, 32, 34)["contraction_group"]
+        selected = analyze_impulse_evidence(df, value, self.cfg)["selected"]
+        self.assertEqual(len(selected["episodes"]), 1)
+        self.assertIn("CONFIRMATION_TIMING_UNAVAILABLE", selected["reasons"])
+
+    def test_invalid_confirmation_timing_is_a_warning_and_does_not_crash_quant(self):
+        df = frame([100.0] * 25 + [110, 120, 130, 115, 90, 95, 105, 120, 114, 110])
+        for invalid in ["unknown", float("nan"), -1, 1.5]:
+            with self.subTest(required=invalid):
+                value = structure(df, 27, 29)
+                value["contraction_group"][0]["required_right_confirm_days"] = invalid
+                value["contraction_group"] += structure(df, 32, 34)["contraction_group"]
+                selected = analyze_impulse_evidence(df, value, self.cfg)["selected"]
+                self.assertEqual(len(selected["episodes"]), 1)
+                self.assertIn("CONFIRMATION_TIMING_UNAVAILABLE", selected["reasons"])
+
+    def test_intraday_breach_or_unconfirmed_round_does_not_start_rebuild(self):
+        df = frame([100.0] * 25 + [110, 120, 130, 115, 110, 120, 115, 113])
+        df.loc[29, "low"] = 90
+        value = structure(df, 27, 29)
+        value["contraction_group"] += structure(df, 30, 32)["contraction_group"]
+        self.assertEqual(len(analyze_impulse_evidence(df, value, self.cfg)["selected"]["episodes"]), 1)
+        df.loc[29, "close"] = 90
+        value["contraction_group"][0]["confirmation_status"] = "PROVISIONAL"
+        self.assertEqual(len(analyze_impulse_evidence(df, value, self.cfg)["selected"]["episodes"]), 1)
+
+    def test_weak_rebuild_keeps_pending_and_does_not_claim_new_structure(self):
+        df = frame([100.0] * 25 + [110, 120, 130, 115, 90, 92, 95, 98, 94, 93])
+        value = structure(df, 27, 29)
+        value["contraction_group"] += structure(df, 32, 34)["contraction_group"]
+        selected = analyze_impulse_evidence(df, value, self.cfg)["selected"]
+        self.assertEqual(selected["status"], "WEAK_ADVANCE")
+        self.assertEqual(selected["lifecycle"], "REBUILD_PENDING")
+        self.assertEqual(selected["episodes"][0]["lifecycle"], "EXHAUSTED")
+
+    def test_new_bars_cannot_change_either_rebuild_anchor(self):
+        df = frame([100.0] * 25 + [110, 120, 130, 115, 90, 95, 105, 120, 114, 110])
+        value = structure(df, 27, 29)
+        value["contraction_group"] += structure(df, 32, 34)["contraction_group"]
+        before = analyze_impulse_evidence(df, value, self.cfg)["selected"]["episodes"]
+        extended = frame(list(df["close"]) + [160, 85, 180])
+        after = analyze_impulse_evidence(extended, value, self.cfg)["selected"]["episodes"]
+        self.assertEqual([x["anchor"] for x in before], [x["anchor"] for x in after])
+        self.assertEqual(before[0], after[0])
+
+    def test_confirmation_is_not_available_before_the_required_right_days(self):
+        df = frame([100.0] * 25 + [110, 120, 130, 115, 90])
+        value = structure(df, 27, 29)
+        value["contraction_group"][0]["required_right_confirm_days"] = 3
+        before = analyze_impulse_evidence(df, value, self.cfg)["selected"]
+        self.assertIsNone(before["exhaustion"])
+        self.assertIn("EXHAUSTION_CONFIRMATION_NOT_YET_AVAILABLE", before["reasons"])
+        extended = frame(list(df["close"]) + [95, 100, 110])
+        after = analyze_impulse_evidence(extended, value, self.cfg)["selected"]
+        self.assertEqual(after["anchor"], before["anchor"])
+        self.assertEqual(after["exhaustion"]["confirmed_idx"], 32)
+
+    def test_rebuild_without_positive_advance_is_pending_and_keeps_old_episode(self):
+        df = frame([100.0] * 25 + [110, 120, 130, 115, 90, 89, 88, 87, 86, 85])
+        value = structure(df, 27, 29)
+        value["contraction_group"] += structure(df, 32, 34)["contraction_group"]
+        selected = analyze_impulse_evidence(df, value, self.cfg)["selected"]
+        self.assertEqual(selected["status"], "NO_ADVANCE")
+        self.assertEqual(selected["lifecycle"], "REBUILD_PENDING")
+        self.assertIsNone(selected["anchor"])
+        self.assertEqual(selected["episodes"][0]["lifecycle"], "EXHAUSTED")
+
+    def test_multiple_rebuilds_keep_every_round_and_old_reference(self):
+        df = frame([100.0] * 25 + [110, 120, 130, 115, 90, 95, 105, 120, 100, 80, 85, 95, 110, 100, 95])
+        value = structure(df, 27, 29)
+        value["contraction_group"] += structure(df, 32, 34)["contraction_group"]
+        value["contraction_group"] += structure(df, 37, 39)["contraction_group"]
+        selected = analyze_impulse_evidence(df, value, self.cfg)["selected"]
+        self.assertEqual([x["group_round_numbers"] for x in selected["episodes"]], [[1], [2], [3]])
+        self.assertEqual([x["lifecycle"] for x in selected["episodes"]], ["EXHAUSTED", "EXHAUSTED", "OPEN"])
+        self.assertEqual(selected["anchor"]["base_idx"], 34)
 
     def test_current_stage_volume_and_context_do_not_filter_historical_price_fact(self):
         df = frame([100.0] * 25 + [110, 130, 120, 115])
@@ -217,6 +349,25 @@ class ImpulseEvidenceTests(unittest.TestCase):
                 conn.close()
         self.assertEqual(restored, payload)
         self.assertEqual(snapshot["impulse_evidence"], evidence)
+
+    def test_candidate_finalization_cannot_hide_a_changed_anchor_or_retention(self):
+        df = frame([100.0] * 25 + [110, 130, 120, 115])
+        actual = self.analyze(df, 26, 28)
+        core = _extension_core(actual)
+        self.assertNotIn("candidate_summaries", core["selected"])
+        self.assertIn("candidate_summaries", actual["selected"])
+        changed = copy.deepcopy(actual)
+        changed["selected"]["retention"]["post_peak"]["close_retention_pct"] += 1
+        self.assertNotEqual(core, _extension_core(changed))
+
+    def test_comparison_rejects_changed_original_record_and_legacy_fingerprint(self):
+        row = {"original_quant": {"name": "fixture"}, "legacy_output_sha256": "original"}
+        for key, replacement in [("original_quant", {"name": "changed"}), ("legacy_output_sha256", "changed")]:
+            with self.subTest(key=key):
+                changed = dict(row)
+                changed[key] = replacement
+                with self.assertRaises(AssertionError):
+                    _research_comparison({"000001": row}, {"000001": changed})
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ import pandas as pd
 
 def empty_impulse_evidence(status, reasons=None):
     return {
-        "schema": "quant_impulse_evidence_v1", "research_only": True,
+        "schema": "quant_impulse_evidence_v2", "research_only": True,
         "as_of": "", "group_start_date": "", "lookback_days": None,
         "status": status, "reasons": reasons or [], "selected": None, "windows": {},
     }
@@ -131,8 +131,9 @@ def _volume_evidence(df, base_idx, peak_idx, cfg):
     return result
 
 
-def _window_evidence(df, group, positions, start, lookback, cfg):
-    scan_start = max(0, start - lookback)
+def _episode_evidence(df, group, positions, start, lookback, cfg, floor=0):
+    window_start = max(0, start - lookback)
+    scan_start = max(window_start, floor)
     closes = df["close"].to_numpy(dtype=float)
     candidates = []
     for base_idx in range(scan_start, start):
@@ -146,19 +147,30 @@ def _window_evidence(df, group, positions, start, lookback, cfg):
             "base_idx": base_idx, "peak_idx": peak_idx,
             "gain_pct": (peak / base - 1) * 100,
             "bridge_drawdown_pct": (bridge_low / peak - 1) * 100,
+            "exhausted": bool(bridge_low <= base),
         })
-    rank = lambda item: (item["gain_pct"], item["base_idx"])
-    linked = [item for item in candidates if item["bridge_drawdown_pct"] >= -cfg["max_bridge_drawdown_pct"]]
-    rejected = [item for item in candidates if item["bridge_drawdown_pct"] < -cfg["max_bridge_drawdown_pct"]]
-    selected = max(linked or candidates, key=rank) if candidates else None
+    rank = lambda item: (item["peak_idx"], item["gain_pct"], item["base_idx"])
+    linked = [item for item in candidates if not item["exhausted"]]
+    substantial = [item for item in linked if item["gain_pct"] >= cfg["min_gain_pct"]]
+    weak = [item for item in candidates if item["gain_pct"] < cfg["min_gain_pct"]]
+    exhausted = [item for item in candidates if item["exhausted"]]
+    selected = max(substantial or linked or exhausted, key=rank) if candidates else None
     result = {
         "lookback_days": lookback, "scan_start_date": str(df.iloc[scan_start]["date"]),
         "available_lookback_days": start - scan_start, "candidate_count": len(candidates),
         "linked_candidate_count": len(linked), "status": "NO_ADVANCE", "reasons": [],
-        "strongest_unlinked_candidate": _candidate_summary(max(rejected, key=rank) if rejected else None, df),
+        "candidate_summaries": [
+            {**_candidate_summary(item, df), "exhausted": item["exhausted"],
+             "bridge_close_retention_pct": _number(
+                 (closes[item["peak_idx"]] * (1 + item["bridge_drawdown_pct"] / 100)
+                  - closes[item["base_idx"]]) / (closes[item["peak_idx"]] - closes[item["base_idx"]]) * 100)}
+            for item in sorted(candidates, key=rank, reverse=True)],
+        "latest_weak_candidate": _candidate_summary(max(weak, key=rank) if weak else None, df),
+        "strongest_exhausted_candidate": _candidate_summary(
+            max(exhausted, key=lambda item: (item["gain_pct"], item["base_idx"])) if exhausted else None, df),
         "anchor": None, "price": None, "volume": None, "retention": None,
     }
-    if start - scan_start < lookback:
+    if start - window_start < lookback:
         result["reasons"].append("SCAN_HISTORY_INCOMPLETE")
     if selected is None:
         result["reasons"].append("NO_ORDERED_PRICE_ADVANCE")
@@ -166,15 +178,17 @@ def _window_evidence(df, group, positions, start, lookback, cfg):
     base_idx, peak_idx = selected["base_idx"], selected["peak_idx"]
     base, peak = closes[base_idx], closes[peak_idx]
     if not linked:
-        result["status"] = "UNLINKED"
-        result["reasons"].append("PLATFORM_LINK_BROKEN")
+        result["status"] = "EXHAUSTED"
+        result["reasons"].append("ADVANCE_FULLY_RETRACED_BEFORE_GROUP")
     elif selected["gain_pct"] >= cfg["min_gain_pct"]:
         result["status"] = "IDENTIFIED"
     else:
         result["status"] = "WEAK_ADVANCE"
         result["reasons"].append("PRICE_GAIN_BELOW_RESEARCH_THRESHOLD")
-    if base_idx == scan_start:
+    if base_idx == window_start:
         result["reasons"].append("BASE_AT_SCAN_BOUNDARY")
+    if floor and base_idx == floor:
+        result["reasons"].append("BASE_AT_REBUILD_BOUNDARY")
     base_date, peak_date, start_date = (str(df.iloc[idx]["date"]) for idx in [base_idx, peak_idx, start])
     path_length = float(np.abs(np.diff(closes[base_idx:peak_idx + 1])).sum())
     result["anchor"] = {
@@ -211,6 +225,89 @@ def _window_evidence(df, group, positions, start, lookback, cfg):
             and "INTRADAY_DATA_INCOMPLETE" not in result["reasons"]):
         result["reasons"].append("INTRADAY_DATA_INCOMPLETE")
     return result
+
+
+def _exhaustion_event(df, item, positions, anchor, round_number):
+    if anchor is None or item.get("confirmation_status") != "CONFIRMED":
+        return None, None
+    a, b = (_position(item, key, positions) for key in ["start", "end"])
+    base = float(df.iloc[anchor["base_idx"]]["close"])
+    if float(df.iloc[b]["close"]) > base:
+        return None, None
+    required = item.get("required_right_confirm_days")
+    if required is None:
+        return None, "CONFIRMATION_TIMING_UNAVAILABLE"
+    try:
+        days = float(required)
+        if not math.isfinite(days) or days < 0 or not days.is_integer():
+            return None, "CONFIRMATION_TIMING_UNAVAILABLE"
+    except (TypeError, ValueError, OverflowError):
+        return None, "CONFIRMATION_TIMING_UNAVAILABLE"
+    confirmed_idx = b + int(days)
+    if confirmed_idx >= len(df):
+        return None, "EXHAUSTION_CONFIRMATION_NOT_YET_AVAILABLE"
+    path = df.iloc[a:b + 1]
+    breach_idx = int(path[path["close"] <= base].index[0])
+    return {
+        "round": round_number, "first_breach_idx": breach_idx,
+        "first_breach_date": str(df.iloc[breach_idx]["date"]),
+        "end_idx": b, "end_date": str(df.iloc[b]["date"]),
+        "end_close": _number(df.iloc[b]["close"]),
+        "confirmed_idx": confirmed_idx, "confirmed_date": str(df.iloc[confirmed_idx]["date"]),
+    }, None
+
+
+def _window_evidence(df, group, positions, start, lookback, cfg):
+    episodes = []
+    pending = None
+    for number, item in enumerate(group, 1):
+        s = _position(item, "start", positions)
+        if not episodes or (pending and pending["confirmed_idx"] <= s):
+            floor = pending["end_idx"] if pending else 0
+            phase = _episode_evidence(df.iloc[:s + 1], [], positions, s, lookback, cfg, floor)
+            phase.update(
+                episode_id=f"{lookback}:{df.iloc[s]['date']}:{floor}",
+                group_start_date=str(df.iloc[s]["date"]),
+                group_round_numbers=[], lifecycle="OPEN", exhaustion=None,
+                rebuild_from=dict(pending) if pending else None,
+                scan_floor_idx=floor,
+            )
+            if phase["status"] == "EXHAUSTED":
+                phase["lifecycle"] = "EXHAUSTED"
+            if pending and phase["status"] != "IDENTIFIED":
+                phase["lifecycle"] = "REBUILD_PENDING"
+                phase["reasons"].append("NO_SUBSTANTIAL_REBUILD_ADVANCE")
+            else:
+                pending = None
+            episodes.append(phase)
+        phase = episodes[-1]
+        phase["group_round_numbers"].append(number)
+        # A pending weak bounce cannot erase or replace the preceding failed impulse.
+        if phase["lifecycle"] != "REBUILD_PENDING" and phase["exhaustion"] is None:
+            event, warning = _exhaustion_event(df, item, positions, phase["anchor"], number)
+            if warning and warning not in phase["reasons"]:
+                phase["reasons"].append(warning)
+            if event:
+                phase.update(lifecycle="EXHAUSTED", exhaustion=event)
+                pending = event
+    for idx, phase in enumerate(episodes):
+        next_start = (_position(group[episodes[idx + 1]["group_round_numbers"][0] - 1], "start", positions)
+                      if idx + 1 < len(episodes) else len(df))
+        horizon = next_start - 1
+        assigned = [group[n - 1] for n in phase["group_round_numbers"]]
+        measurements = _episode_evidence(
+            df.iloc[:horizon + 1], assigned, positions,
+            _position(assigned[0], "start", positions), lookback, cfg, phase["scan_floor_idx"])
+        for key in ["anchor", "price", "volume", "retention"]:
+            phase[key] = measurements[key]
+        if measurements["anchor"]:
+            for path, number in zip(phase["retention"]["rounds"], phase["group_round_numbers"]):
+                path["round"] = number
+        phase["reasons"] = list(dict.fromkeys(phase["reasons"] + measurements["reasons"]))
+        phase["observed_through"] = str(df.iloc[horizon]["date"])
+    current = dict(episodes[-1])
+    current.update(episodes=episodes, active_episode_id=current["episode_id"])
+    return current
 
 
 def analyze_impulse_evidence(df, structure, cfg):
@@ -255,6 +352,8 @@ def analyze_impulse_evidence(df, structure, cfg):
     for lookback in windows:
         result["windows"][str(lookback)] = _window_evidence(frame, group, positions, start, lookback, cfg)
     result["selected"] = result["windows"][str(cfg["lookback_days"])]
+    result["original_group_start_date"] = result["group_start_date"]
+    result["group_start_date"] = result["selected"]["group_start_date"]
     result["status"] = result["selected"]["status"]
     result["reasons"] = list(result["selected"]["reasons"])
     return result

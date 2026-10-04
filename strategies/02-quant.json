@@ -1,5 +1,5 @@
 {
-  "strategy_version": "model2_quant_v33",
+  "strategy_version": "model2_quant_v34",
   "description": "Model 2 VCP structure, setup signals and research-only impulse evidence parameters. Algorithms stay in scripts/quant_filter.py and scripts/impulse_evidence.py.",
   "price_adjustment": {
     "mode": "point_in_time_qfq",
@@ -104,7 +104,6 @@
       "baseline_volume_days": 20,
       "min_gain_pct": 12.0,
       "min_up_peak_volume_ratio": 1.5,
-      "max_bridge_drawdown_pct": 12.0,
       "upper_shadow_warning_ratio": 0.5
     },
     "strong_impulse_context": {
