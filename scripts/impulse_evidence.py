@@ -66,11 +66,23 @@ def _retention_path(df, start, end, base, peak):
     return result
 
 
+def _one_price_up_mask(df):
+    if not all(key in df for key in ("open", "high", "low", "close")):
+        return pd.Series(False, index=df.index), pd.Series(False, index=df.index)
+    prices = df[["open", "high", "low", "close"]].apply(pd.to_numeric, errors="coerce")
+    previous = prices["close"].shift()
+    valid = (np.isfinite(prices).all(axis=1) & prices.gt(0).all(axis=1)
+             & np.isfinite(previous) & previous.gt(0))
+    one_price = prices.eq(prices["close"], axis=0).all(axis=1)
+    return valid & one_price & prices["close"].gt(previous), valid
+
+
 def _volume_evidence(df, base_idx, peak_idx, cfg):
     count = int(cfg["baseline_volume_days"])
     baseline = df.iloc[max(0, base_idx - count):base_idx]
     leg = df.iloc[base_idx + 1:peak_idx + 1]
     result = {
+        "volume_policy": "exclude_one_price_up_v1",
         "baseline_start_date": str(baseline.iloc[0]["date"]) if not baseline.empty else "",
         "baseline_end_date": str(baseline.iloc[-1]["date"]) if not baseline.empty else "",
         "baseline_days": len(baseline), "baseline_mean": None,
@@ -82,6 +94,17 @@ def _volume_evidence(df, base_idx, peak_idx, cfg):
         "peak_volume_day_return_pct": None, "peak_volume_upper_shadow_ratio": None,
         "warnings": [],
     }
+    excluded, checked = _one_price_up_mask(df)
+    baseline_excluded = excluded.loc[baseline.index]
+    leg_excluded = excluded.loc[leg.index]
+    result.update(
+        baseline_effective_days=int((~baseline_excluded).sum()),
+        advance_effective_days=int((~leg_excluded).sum()),
+        baseline_excluded_dates=baseline.loc[baseline_excluded, "date"].astype(str).tolist(),
+        advance_excluded_dates=leg.loc[leg_excluded, "date"].astype(str).tolist(),
+    )
+    if not checked.loc[baseline.index.union(leg.index)].all():
+        result["warnings"].append("ONE_PRICE_CHECK_INCOMPLETE")
     if len(baseline) < count:
         result["warnings"].append("BASELINE_INCOMPLETE")
     if "volume" not in df or baseline.empty:
@@ -93,8 +116,14 @@ def _volume_evidence(df, base_idx, peak_idx, cfg):
             and np.isfinite(volumes).all() and (volumes > 0).all()):
         result["warnings"].append("VOLUME_DATA_INCOMPLETE")
         return result
+    baseline_volumes = baseline_volumes.loc[~baseline_excluded]
+    volumes = volumes.loc[~leg_excluded]
+    if baseline_volumes.empty or volumes.empty:
+        result["warnings"].extend(["VOLUME_SAMPLE_EMPTY", "VOLUME_DATA_INCOMPLETE"])
+        return result
     mean = float(baseline_volumes.mean())
-    changes = df["close"].diff().iloc[base_idx + 1:peak_idx + 1]
+    # Direction still uses the actual preceding close, including excluded days.
+    changes = df["close"].diff().loc[volumes.index]
     up = volumes[changes > 0]
     down = volumes[changes < 0]
     result.update(
@@ -131,7 +160,7 @@ def _volume_evidence(df, base_idx, peak_idx, cfg):
     return result
 
 
-def _episode_evidence(df, group, positions, start, lookback, cfg, floor=0):
+def _episode_evidence(df, group, positions, start, lookback, cfg, floor=0, candidate_selector=None):
     window_start = max(0, start - lookback)
     scan_start = max(window_start, floor)
     closes = df["close"].to_numpy(dtype=float)
@@ -155,6 +184,10 @@ def _episode_evidence(df, group, positions, start, lookback, cfg, floor=0):
     weak = [item for item in candidates if item["gain_pct"] < cfg["min_gain_pct"]]
     exhausted = [item for item in candidates if item["exhausted"]]
     selected = max(substantial or linked or exhausted, key=rank) if candidates else None
+    selection = None
+    if candidate_selector is not None:
+        selection = candidate_selector(df.iloc[:start + 1], candidates, scan_start, start, cfg)
+        selected = selection["selected"]
     result = {
         "lookback_days": lookback, "scan_start_date": str(df.iloc[scan_start]["date"]),
         "available_lookback_days": start - scan_start, "candidate_count": len(candidates),
@@ -170,10 +203,14 @@ def _episode_evidence(df, group, positions, start, lookback, cfg, floor=0):
             max(exhausted, key=lambda item: (item["gain_pct"], item["base_idx"])) if exhausted else None, df),
         "anchor": None, "price": None, "volume": None, "retention": None,
     }
+    if selection is not None:
+        result.update(selection["diagnostics"], status=selection["status"])
+        result["reasons"].extend(selection["reasons"])
     if start - window_start < lookback:
         result["reasons"].append("SCAN_HISTORY_INCOMPLETE")
     if selected is None:
-        result["reasons"].append("NO_ORDERED_PRICE_ADVANCE")
+        if selection is None:
+            result["reasons"].append("NO_ORDERED_PRICE_ADVANCE")
         return result
     base_idx, peak_idx = selected["base_idx"], selected["peak_idx"]
     base, peak = closes[base_idx], closes[peak_idx]
@@ -257,14 +294,14 @@ def _exhaustion_event(df, item, positions, anchor, round_number):
     }, None
 
 
-def _window_evidence(df, group, positions, start, lookback, cfg):
+def _window_evidence(df, group, positions, start, lookback, cfg, candidate_selector=None):
     episodes = []
     pending = None
     for number, item in enumerate(group, 1):
         s = _position(item, "start", positions)
         if not episodes or (pending and pending["confirmed_idx"] <= s):
             floor = pending["end_idx"] if pending else 0
-            phase = _episode_evidence(df.iloc[:s + 1], [], positions, s, lookback, cfg, floor)
+            phase = _episode_evidence(df.iloc[:s + 1], [], positions, s, lookback, cfg, floor, candidate_selector)
             phase.update(
                 episode_id=f"{lookback}:{df.iloc[s]['date']}:{floor}",
                 group_start_date=str(df.iloc[s]["date"]),
@@ -297,7 +334,7 @@ def _window_evidence(df, group, positions, start, lookback, cfg):
         assigned = [group[n - 1] for n in phase["group_round_numbers"]]
         measurements = _episode_evidence(
             df.iloc[:horizon + 1], assigned, positions,
-            _position(assigned[0], "start", positions), lookback, cfg, phase["scan_floor_idx"])
+            _position(assigned[0], "start", positions), lookback, cfg, phase["scan_floor_idx"], candidate_selector)
         for key in ["anchor", "price", "volume", "retention"]:
             phase[key] = measurements[key]
         if measurements["anchor"]:
@@ -310,7 +347,7 @@ def _window_evidence(df, group, positions, start, lookback, cfg):
     return current
 
 
-def analyze_impulse_evidence(df, structure, cfg):
+def analyze_impulse_evidence(df, structure, cfg, candidate_selector=None):
     """Return evidence without mutating the frame, group, existing tags or decisions."""
     if not cfg.get("enabled"):
         return empty_impulse_evidence("DISABLED")
@@ -345,12 +382,12 @@ def analyze_impulse_evidence(df, structure, cfg):
     windows = sorted(set([int(cfg["lookback_days"])] + [int(n) for n in cfg["diagnostic_lookback_days"]]))
     if any(n <= 0 for n in windows) or int(cfg["baseline_volume_days"]) <= 0:
         raise ValueError("Impulse evidence windows must be positive")
-    needed = frame.iloc[max(0, start - max(windows)):]["close"]
+    needed = frame.iloc[max(0, start - max(windows) - int(cfg.get("base_context_days", 0))):]["close"]
     if not np.isfinite(needed).all() or not (needed > 0).all():
         result["reasons"] = ["CLOSE_DATA_INVALID"]
         return result
     for lookback in windows:
-        result["windows"][str(lookback)] = _window_evidence(frame, group, positions, start, lookback, cfg)
+        result["windows"][str(lookback)] = _window_evidence(frame, group, positions, start, lookback, cfg, candidate_selector)
     result["selected"] = result["windows"][str(cfg["lookback_days"])]
     result["original_group_start_date"] = result["group_start_date"]
     result["group_start_date"] = result["selected"]["group_start_date"]

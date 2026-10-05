@@ -13,7 +13,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts import quant_filter as quant
-from scripts.impulse_evidence import analyze_impulse_evidence
+from scripts.impulse_evidence import analyze_impulse_evidence, _volume_evidence
+from scripts.impulse_score import impulse_metrics
 from scripts.data.strategy_data_store import connect, load_document, save_quant
 from scripts.audit_impulse_evidence import _extension_core, _research_comparison
 
@@ -47,6 +48,81 @@ class ImpulseEvidenceTests(unittest.TestCase):
 
     def analyze(self, df, start, end):
         return analyze_impulse_evidence(df, structure(df, start, end), self.cfg)
+
+    def test_one_price_up_keeps_price_path_but_excludes_volume_and_count(self):
+        df = frame([100.0] * 25 + [110, 121, 120, 130, 125, 120])
+        df.loc[25:28, "volume"] = [10, 200, 300, 400]
+        before = self.analyze(df, 28, 30)["selected"]
+        df.loc[25, ["open", "high", "low"]] = 110
+        after = self.analyze(df, 28, 30)["selected"]
+        self.assertEqual(before["anchor"], after["anchor"])
+        self.assertEqual(before["price"], after["price"])
+        self.assertEqual(before["retention"], after["retention"])
+        volume = after["volume"]
+        self.assertEqual(volume["advance_days"], 4)
+        self.assertEqual(volume["advance_effective_days"], 3)
+        self.assertEqual(volume["up_days"], 2)
+        self.assertEqual(volume["down_days"], 1)
+        self.assertEqual(volume["up_mean_volume_ratio"], 3)
+        self.assertEqual(volume["down_mean_volume_ratio"], 3)
+        self.assertEqual(volume["advance_excluded_dates"], [df.iloc[25]["date"]])
+
+    def test_baseline_exclusion_does_not_extend_window(self):
+        df = frame([100.0] * 25 + [110, 120])
+        df.loc[10, ["open", "high", "low", "close"]] = 110
+        df.loc[10, "volume"] = 1
+        volume = _volume_evidence(df, 24, 26, self.cfg)
+        self.assertEqual(volume["baseline_days"], 20)
+        self.assertEqual(volume["baseline_effective_days"], 19)
+        self.assertEqual(volume["baseline_start_date"], df.iloc[4]["date"])
+        self.assertEqual(volume["baseline_mean"], 100)
+
+    def test_one_price_down_flat_and_normal_up_are_not_excluded(self):
+        df = frame([100.0] * 25 + [110, 109, 109, 120])
+        for idx in [26, 27]:
+            df.loc[idx, ["open", "high", "low"]] = df.loc[idx, "close"]
+        volume = _volume_evidence(df, 24, 28, self.cfg)
+        self.assertEqual(volume["advance_excluded_dates"], [])
+        self.assertEqual(volume["advance_effective_days"], 4)
+
+    def test_empty_volume_samples_are_incomplete_not_zero_score(self):
+        cfg = {"baseline_volume_days": 20}
+        for exclude_baseline in [False, True]:
+            df = frame([100 + idx for idx in range(30)])
+            indices = range(4, 24) if exclude_baseline else range(25, 28)
+            for idx in indices:
+                df.loc[idx, ["open", "high", "low"]] = df.loc[idx, "close"]
+            item = self.analyze(df, 27, 29)
+            # Use fixed indices to test exhaustion of each volume window.
+            volume = _volume_evidence(df, 24, 27, self.cfg)
+            self.assertIn("VOLUME_SAMPLE_EMPTY", volume["warnings"])
+            self.assertIsNone(volume["up_mean_volume_ratio"])
+            item["selected"]["volume"] = volume
+            self.assertEqual(impulse_metrics(item, cfg)["status"], "INCOMPLETE")
+
+    def test_missing_ohlc_does_not_guess_exclusions(self):
+        df = frame([100.0] * 25 + [110, 120]).drop(columns="open")
+        volume = _volume_evidence(df, 24, 26, self.cfg)
+        self.assertEqual(volume["advance_excluded_dates"], [])
+        self.assertIn("ONE_PRICE_CHECK_INCOMPLETE", volume["warnings"])
+
+    def test_only_down_samples_remaining_cannot_score_as_weak_advance(self):
+        df = frame([100.0] * 25 + [120, 119, 130, 125, 120])
+        for idx in [25, 27]:
+            df.loc[idx, ["open", "high", "low"]] = df.loc[idx, "close"]
+        item = self.analyze(df, 27, 29)
+        volume = item["selected"]["volume"]
+        self.assertEqual(volume["up_days"], 0)
+        self.assertEqual(volume["down_days"], 1)
+        self.assertEqual(impulse_metrics(item, {"baseline_volume_days": 20})["status"], "INCOMPLETE")
+
+    def test_invalid_volume_is_not_hidden_by_exclusion(self):
+        df = frame([100.0] * 25 + [110, 120])
+        df.loc[25, ["open", "high", "low"]] = 110
+        df.loc[25, "volume"] = float("nan")
+        volume = _volume_evidence(df, 24, 26, self.cfg)
+        self.assertIn("VOLUME_DATA_INCOMPLETE", volume["warnings"])
+        self.assertIsNone(volume["up_mean_volume_ratio"])
 
     def test_earlier_high_cannot_use_a_later_low_as_its_base(self):
         df = frame([100.0] * 25 + [140, 138, 135, 90, 95, 105, 115, 110, 108])

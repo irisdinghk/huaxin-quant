@@ -1,6 +1,8 @@
-# Quant推进研究字段参考（v34）
+# Quant推进研究字段参考（v35）
 
 本页配合[模型二指令](02-quant.md)，定义第一步推进与重建研究指标；生产尚未接入评分，独立计算见[评分试算参考](02-quant-score-trial-ref.md)。
+
+本页v35参数和排序用于生产辅助证据。隔离research_v7通过可选候选选择器改为60条搜索、放量资格及最近有效低点排序，详见评分试算参考；未传选择器的原输出保持兼容，不将隔离规则视为生产现行规则。
 
 ## 参数与候选选择
 
@@ -47,6 +49,8 @@
 - `gain_pct=(H/B-1)*100`。
 - `path_efficiency=(H-B)/sum(abs(close[t]-close[t-1]))`，t范围 `(B,H]`；正向推进取值0—1。
 - 推进成交量区间 `(B,H]`，按每条收盘相对前一条收盘上涨、下跌、持平分类。基准取B之前最多20条，实际条数另列；不足20条标记 `BASELINE_INCOMPLETE`，放量确认留空。
+- 量能口径 `volume_policy=exclude_one_price_up_v1`：日线OHLC有效、严格相等且收盘高于前收时识别为一字上涨日，从推进及基准量样本中同时剔除成交量和样本天数。这是成交受限形态代理，不声称核验了交易所涨停价；不按统一10%阈值识别，不排除普通缩量上涨、持平或一字下跌。缺少OHLC时不猜测剔除，并标记 `ONE_PRICE_CHECK_INCOMPLETE`。
+- `baseline_days`、`advance_days`仍是原窗口条数；`baseline_effective_days`、`advance_effective_days`为量能有效样本数，`baseline_excluded_dates`、`advance_excluded_dates`记录剔除日期；方向天数与峰量、占比均按剩余样本计算。原窗口不向前扩展；价格涨幅、路径效率和耗时完全保留一字日。全被剔除时标记 `VOLUME_SAMPLE_EMPTY`及`VOLUME_DATA_INCOMPLETE`，比值留空。原始缺失或非正成交量仍报数据不足，不借剔除掩盖缺失。
 - 分别输出推进均量、上涨/下跌日均量和峰量相对基准倍数，以及上涨日量占整个推进段量的比例。 `up_peak_volume_confirmed` 只在基准完整且上涨日峰量倍数达到1.5时为真；不决定价格状态。
 - 最大量日附日期、整日收盘涨跌和上影/振幅。最大量在下跌日标记 `PEAK_VOLUME_ON_DOWN_DAY`；上影比例至少0.5标记 `PEAK_VOLUME_LONG_UPPER_SHADOW`。这些是证据警示，不作结构排除。
 - 价格有效、但量缺失或非正数时，量证据标记 `VOLUME_DATA_INCOMPLETE`，不制造0倍或已确认放量；收盘仍可用于保留研究。无法使用的日内高低另列 `INTRADAY_DATA_INCOMPLETE`。

@@ -1,4 +1,4 @@
-"""Isolated 100+12 impulse scoring with read-only inputs and frozen calibration."""
+"""Isolated structure scoring with read-only inputs and frozen calibration."""
 
 import argparse
 import copy
@@ -11,6 +11,7 @@ import sys
 import types
 from collections import Counter
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +22,9 @@ from scripts import quant_filter as quant
 from scripts.data.corporate_actions import apply_point_in_time_qfq, load_actions
 from scripts.data.strategy_data_store import load_document
 from scripts.impulse_score import calibrate, score_structure, setup_conversion, validate_config
+from scripts.contraction_quality import analyze_contraction_quality
+from scripts.terminal_micro import analyze_terminal_micro
+from scripts.impulse_selection import analyze_selected_impulse, validate_selection_config
 
 
 def canonical(value):
@@ -34,22 +38,31 @@ def digest(value):
 def source_hashes():
     return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in [
         "scripts/quant_filter.py", "scripts/impulse_evidence.py", "strategies/02-quant.json",
-        "scripts/impulse_score.py", "scripts/audit_impulse_score.py", "strategies/02-quant-trial.json"]}
+        "scripts/impulse_score.py", "scripts/contraction_quality.py", "scripts/terminal_micro.py", "scripts/audit_impulse_score.py",
+        "strategies/02-quant-trial.json", "scripts/impulse_selection.py"]}
 
 
 def trial_module(cfg, calibration):
     """Load an independent module namespace; never replace production globals."""
+    selection = cfg.get("impulse_selection", {})
+    validate_selection_config(selection)
     module = types.ModuleType("quant_impulse_score_trial")
     module.__file__ = str(ROOT / "scripts/quant_filter.py")
     source = (ROOT / "scripts/quant_filter.py").read_text(encoding="utf-8")
     exec(compile(source, module.__file__, "exec"), module.__dict__)
+    if selection.get("enabled", False):
+        module.analyze_impulse_evidence = partial(analyze_selected_impulse, trial_cfg=cfg)
     original_score, original_finalize = module.score_setup, module.finalize_setup_score
     calls = []
 
     def score(df, structure, pullback, retest, overheat):
         old = original_score(df, structure, pullback, retest, overheat)
         evidence = module.analyze_impulse_evidence(df, structure, module.IMPULSE_EVIDENCE_CFG)
-        scored = score_structure(old["components"], evidence, cfg, calibration)
+        quality = analyze_contraction_quality(df, structure, cfg, evidence)
+        terminal = analyze_terminal_micro(df, structure, cfg)
+        scored = score_structure(old["components"], evidence, cfg, calibration,
+                                 extension_details=structure.get("contraction_extensions"),
+                                 contraction_quality=quality, terminal_micro=terminal)
         day = str(df.iloc[-1]["date"])
         anchor = ((evidence.get("selected") or {}).get("anchor") or {})
         if anchor.get("peak_date") and anchor["peak_date"] > day:
@@ -68,7 +81,8 @@ def trial_module(cfg, calibration):
         raw = context.get("structure_score")
         conversion = None
         if raw is not None:
-            conversion = setup_conversion(raw, module.SETUP_SCORING_CFG.get("structure_quality", {}))
+            maximum = 100 + cfg["budget"]["extension"] + cfg["budget"].get("contraction_quality", 0)
+            conversion = setup_conversion(raw, module.SETUP_SCORING_CFG.get("structure_quality", {}), maximum)
             context["structure_score"] = conversion["normalized_structure"]
         result = original_finalize(signal, action, reasons, misses, temporary, overheat)
         if conversion is not None:
@@ -80,9 +94,36 @@ def trial_module(cfg, calibration):
     return module, calls
 
 
+def load_trial_frame(market, code, day, original):
+    raw = pd.read_sql_query(
+        "SELECT trade_date AS date,open,high,low,close,volume,amount,source "
+        "FROM daily_bars WHERE code=? AND trade_date<=? ORDER BY trade_date",
+        market, params=(code, day))
+    if raw.empty or str(raw.iloc[-1]["date"]) != day:
+        raise ValueError(f"Target bars missing: {day} {code}")
+    adjusted, applied = apply_point_in_time_qfq(raw, load_actions(market, code, day), day)
+    df = quant.calc_indicators(adjusted.reset_index(drop=True))
+    if len(df) != original["data_days"] or abs(float(df.iloc[-1]["close"]) - original["close"]) >= .011:
+        raise ValueError(f"Authority price or history conflict: {day} {code}")
+    return df, applied
+
+
 def rank(records, score_key):
     selected = [(code, item[score_key]) for code, item in records.items() if item[score_key] is not None]
     return {code: index for index, (code, _) in enumerate(sorted(selected, key=lambda x: (-x[1], x[0])), 1)}
+
+
+def score_distribution(values):
+    series = pd.Series(values, dtype=float).dropna()
+    if series.empty:
+        return {"count": 0}
+    return {"count": len(series), "min": float(series.min()), "median": float(series.median()),
+            "mean": float(series.mean()), "p90": float(series.quantile(.9)), "max": float(series.max()),
+            "bands": {"below_40": int((series < 40).sum()),
+                      "40_to_60": int(((series >= 40) & (series < 60)).sum()),
+                      "60_to_80": int(((series >= 60) & (series < 80)).sum()),
+                      "80_to_100": int(((series >= 80) & (series < 100)).sum()),
+                      "100_or_more": int((series >= 100).sum())}}
 
 
 def write_json(path, value):
@@ -109,6 +150,15 @@ def summarize(day, details, document):
         "adjustment_status_counts": dict(Counter(x["original_quant"].get("adjustment_status", "UNKNOWN") for x in details.values())),
         "replay_usable": len(valid_replays), "replay_incomplete": len(details) - len(valid_replays),
         "production_output_changes": 0,
+        "main_comparison": "current_production_same_input_vs_complete_trial_replay",
+        "production_score_distribution": score_distribution(x["baseline_score"] for x in valid_replays),
+        "trial_score_distribution": score_distribution(x["replay_score"] for x in valid_replays),
+        "production_stage_counts": dict(Counter(x["baseline_decision"]["structure_stage"] for x in valid_replays)),
+        "production_signal_counts": dict(Counter(x["baseline_decision"]["setup_signal"] for x in valid_replays)),
+        "trial_signal_counts": dict(Counter(x["trial_decision"]["setup_signal"] for x in valid_replays)),
+        "primary_score_increases": sum(x["replay_score"] > x["baseline_score"] for x in valid_replays),
+        "primary_score_decreases": sum(x["replay_score"] < x["baseline_score"] for x in valid_replays),
+        "primary_score_equal": sum(x["replay_score"] == x["baseline_score"] for x in valid_replays),
         "archive_vs_same_input_difference_rows": sum(bool(x["archive_baseline_difference_fields"]) for x in details.values()),
         "trial_stage_changes": sum(x["baseline_decision"]["structure_stage"] != x["trial_decision"]["structure_stage"] for x in valid_replays),
         "trial_group_changes": sum(digest(x["baseline_decision"]["contraction_group"]) != digest(x["trial_decision"]["contraction_group"]) for x in valid_replays),
@@ -130,8 +180,13 @@ def summarize(day, details, document):
 
 
 def report(out, metas, calibration):
-    lines = ["# 推进评分独立试算：基础100＋扩展12", "",
-             "仅研究，生产评分未接入。预算：收缩阶段40、推进30、整理量能20、趋势5、位置5；原扩展另加0—12。",
+    cfg = calibration.get("config", {})
+    quality_budget = cfg.get("budget", {}).get("contraction_quality", 0)
+    maximum = 112 + quality_budget
+    lines = [f"# 推进评分独立试算：基础100＋扩展12＋序列{quality_budget}", "",
+             f"仅研究，生产评分未接入。预算：收缩阶段40、推进30、整理量能20、趋势5、位置5；原扩展另加0—12，优质序列另加0或{quality_budget}。",
+             f"研究版本：{cfg.get('strategy_version', '未记录')}；Q曲线：{cfg.get('quality_curve', 'linear')}；保留折扣：{cfg.get('retention_curve', 'linear')}。真实retention与retention_coefficient分别记录，系数用于贡献计算。",
+             f"扩展分研究覆盖：{cfg.get('extension_score_overrides', {})}；尾段新判定启用：{cfg.get('terminal_micro_bonus', {}).get('enabled', False)}，原分与研究分及尾段证据分别输出。",
              f"标定日：{calibration['calibration_date']}，完整去重锚点{len(calibration['samples'])}个。参数冻结后应用后续日；相邻日不是独立样本外验证。", "",
              "| 指标 | 起分值 | 满分值（标定p90） | 样本数 |", "|---|---:|---:|---:|"]
     for key, mapping in calibration["mappings"].items():
@@ -141,8 +196,8 @@ def report(out, metas, calibration):
     for meta in metas:
         lines.append(f"| {meta['day']} | {meta['rows']} | {meta['archive_score_complete']} | {meta['replay_usable']} | 0 | {sum(meta['signal_transitions'].values())} | {meta['trial_max_score']:.2f} |")
     lines.extend(["", "## 阅读与边界", "",
-                  "comparison CSV 的 archive_trial 是原权威分项的试算，baseline 为同输入原算法重算，replay 为独立内存新评分重放。排名按分数降序、代码升序破同分；全量排名与原有原组范围内排名分别记录。",
-                  "112分先归一到100再按原0.6换算买点结构基础；旧0.6直接乘后封顶仅列诊断。原数值买点门槛固定，评级变化不等于已批准的新交易规则。",
+                  "主要比较是baseline（当前正式策略同输入重算）与replay（完整隔离评分重放）；production_rank/trial_rank及对应group_rank用于该主要比较。archive_trial和old_rank/new_rank仅为原历史档案分项诊断。排名按分数降序、代码升序破同分；全量排名与正式重算有收缩组范围内排名分别记录。",
+                  f"{maximum}分先归一到100再按原0.6换算买点结构基础；旧0.6直接乘后封顶仅列诊断。原数值买点门槛固定，评级变化不等于已批准的新交易规则。",
                   "历史评分调用用对应锚点截止的行情重新计算推进与最低收盘保留；没有套用分析日当前推进。历史锚点套用标定日参数仅作敏感性研究，不代表参数当时已可得。",
                   "缺失评分的内部兼容占位仅为收集诊断；trial_decision=null并标明不可用，不输出有效新信号。原失败、复权PARTIAL/PENDING不补造或提升。",
                   "未取外部数据、未运行daily、未写生产库/JSON/CSV、未计算后续收益。生产参数和原函数保持不变，重放前后原输出逐条一致。",
@@ -170,6 +225,7 @@ def main():
         parser.error("Evidence input must be a reports/research directory")
     cfg = json.loads((ROOT / "strategies/02-quant-trial.json").read_text(encoding="utf-8"))
     validate_config(cfg)
+    validate_selection_config(cfg.get("impulse_selection", {}))
     hashes = source_hashes()
     verification = json.loads((evidence_dir / "final_verification.json").read_text(encoding="utf-8"))
     for name, expected in verification["final_source_sha256"].items():
@@ -198,7 +254,15 @@ def main():
             evidence_by_day[day] = saved
             manifest_inputs[day] = {"evidence_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                                     "authority_sha256": digest(documents[day])}
-        calibration = calibrate([(code, x["impulse_evidence"]) for code, x in evidence_by_day[calibration_day].items()], cfg, calibration_day)
+        calibration_evidence = {code: item["impulse_evidence"]
+                                for code, item in evidence_by_day[calibration_day].items()}
+        if cfg.get("impulse_selection", {}).get("enabled", False):
+            for code, item in evidence_by_day[calibration_day].items():
+                df, _ = load_trial_frame(market, code, calibration_day, item["original_quant"])
+                calibration_evidence[code] = analyze_selected_impulse(
+                    df, item["original_quant"], quant.IMPULSE_EVIDENCE_CFG, cfg)
+            manifest_inputs[calibration_day]["selection_calibration_evidence_sha256"] = digest(calibration_evidence)
+        calibration = calibrate(list(calibration_evidence.items()), cfg, calibration_day)
         calibration["config"] = cfg
         calibration["config_sha256"] = hashes["strategies/02-quant-trial.json"]
         frozen_calibration_hash = digest(calibration)
@@ -207,15 +271,17 @@ def main():
             details = {}
             for ordinal, (code, saved) in enumerate(evidence_by_day[day].items(), 1):
                 original = saved["original_quant"]
-                scored = score_structure(original["score_components"], saved["impulse_evidence"], cfg, calibration)
-                raw = pd.read_sql_query("SELECT trade_date AS date,open,high,low,close,volume,amount,source FROM daily_bars WHERE code=? AND trade_date<=? ORDER BY trade_date", market, params=(code, day))
-                if raw.empty or str(raw.iloc[-1]["date"]) != day:
-                    raise ValueError(f"Target bars missing: {day} {code}")
-                actions = load_actions(market, code, day)
-                adjusted, applied = apply_point_in_time_qfq(raw, actions, day)
-                df = quant.calc_indicators(adjusted.reset_index(drop=True))
-                if len(df) != original["data_days"] or abs(float(df.iloc[-1]["close"]) - original["close"]) >= .011:
-                    raise ValueError(f"Authority price or history conflict: {day} {code}")
+                df, applied = load_trial_frame(market, code, day, original)
+                evidence = saved["impulse_evidence"]
+                if cfg.get("impulse_selection", {}).get("enabled", False):
+                    evidence = analyze_selected_impulse(df, original, quant.IMPULSE_EVIDENCE_CFG, cfg)
+                    if day == calibration_day and canonical(evidence) != canonical(calibration_evidence[code]):
+                        raise AssertionError("Selection evidence changed after calibration")
+                quality = analyze_contraction_quality(df, original, cfg, evidence)
+                terminal = analyze_terminal_micro(df, original, cfg)
+                scored = score_structure(original["score_components"], evidence, cfg, calibration,
+                                         extension_details=original.get("contraction_extensions"),
+                                         contraction_quality=quality, terminal_micro=terminal)
                 df_before = df.copy(deep=True)
                 baseline = quant.screen(df, code=code)
                 calls.clear()
@@ -230,27 +296,49 @@ def main():
                 usable = all(call["score"]["status"] == "COMPLETE" for call in calls_saved)
                 archive_differences = [key for key in baseline if key in original and canonical(baseline[key]) != canonical(original[key])]
                 details[code] = {"original_quant": original, "archive_trial": scored,
+                                 "trial_impulse_evidence": evidence,
                                  "baseline_decision": baseline, "trial_decision": trial if usable else None,
                                  "replay_usable": usable, "score_calls": calls_saved,
                                  "archive_baseline_difference_fields": archive_differences,
                                  "input_df_sha256": digest(df.to_json(orient="split", double_precision=15)),
                                  "applied_actions": applied,
-                                 "original_score": original["structure_score"], "trial_score": scored["total"]}
+                                 "original_score": original["structure_score"], "trial_score": scored["total"],
+                                 "baseline_score": baseline["structure_score"],
+                                 "replay_score": trial["structure_score"] if usable else None}
                 if ordinal % 50 == 0:
                     print(f"{day}: {ordinal}/{len(evidence_by_day[day])}, original output changes=0", flush=True)
             old_ranks, new_ranks = rank(details, "original_score"), rank(details, "trial_score")
             grouped = {code: x for code, x in details.items() if x["original_quant"].get("contraction_group")}
             group_old, group_new = rank(grouped, "original_score"), rank(grouped, "trial_score")
+            production_ranks, trial_ranks = rank(details, "baseline_score"), rank(details, "replay_score")
+            production_group = {code: x for code, x in details.items() if x["baseline_decision"].get("contraction_group")}
+            production_group_ranks = rank(production_group, "baseline_score")
+            trial_group_ranks = rank(production_group, "replay_score")
             rows = []
             for code, item in details.items():
                 old, new, score = item["original_quant"], item["trial_decision"] or {}, item["archive_trial"]
                 row = {"code": code, "name": old["name"], "original_stage": old["structure_stage"],
                        "original_score": item["original_score"], "archive_trial": item["trial_score"],
                        "basic": score["basic"], "extension": score["extension"],
+                       "extension_original": score["extension_original"],
+                       "contraction_quality_status": (score.get("contraction_quality") or {}).get("status"),
+                       "contraction_quality_hit": (score.get("contraction_quality") or {}).get("hit"),
+                       "terminal_micro_status": (score.get("terminal_micro") or {}).get("status"),
+                       "terminal_micro_hit": (score.get("terminal_micro") or {}).get("hit"),
+                       "score_maximum": score["score_maximum"],
                        "old_rank": old_ranks[code], "new_rank": new_ranks.get(code),
                        "rank_improvement": old_ranks[code] - new_ranks[code] if code in new_ranks else None,
                        "old_group_rank": group_old.get(code), "new_group_rank": group_new.get(code),
+                       "production_rank": production_ranks[code], "trial_rank": trial_ranks.get(code),
+                       "primary_rank_improvement": production_ranks[code] - trial_ranks[code] if code in trial_ranks else None,
+                       "production_group_rank": production_group_ranks.get(code),
+                       "trial_group_rank": trial_group_ranks.get(code),
                        "quality": score["impulse"]["quality"], "retention": score["impulse"].get("retention"),
+                       "strategy_version": score.get("strategy_version"),
+                       "quality_curve": score["impulse"]["quality_curve"],
+                       "retention_curve": score["impulse"]["retention_curve"],
+                       "retention_coefficient": score["impulse"]["retention_coefficient"],
+                       "retention_discount": score["impulse"]["retention_discount"],
                        "base_date": score["impulse"].get("base_date"), "peak_date": score["impulse"].get("peak_date"),
                        "status": score["status"], "reasons": ";".join(score["reasons"]),
                        "adjustment_status": old.get("adjustment_status"), "replay_usable": item["replay_usable"],
@@ -267,6 +355,9 @@ def main():
             print(canonical(meta), flush=True)
         if frozen_calibration_hash != digest(calibration):
             raise AssertionError("Calibration changed during validation")
+        for day in days:
+            if digest(load_document(strategy, "quant", day)) != manifest_inputs[day]["authority_sha256"]:
+                raise AssertionError("Authority document changed during validation")
         if (hashes != source_hashes() or production_parameters != digest(quant.QUANT_STRATEGY)
                 or production_functions != (quant.score_setup, quant.finalize_setup_score)):
             raise AssertionError("Production source, parameters or functions changed during trial")
