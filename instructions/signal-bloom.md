@@ -1,7 +1,7 @@
 # Signal Bloom：模型四 Bloom 信号层指令卡
 
 - **版本管理**: 由 Git 分支与提交历史管理
-- **最近更新**: 2026-08-21
+- **最近更新**: 2026-10-06（评分口径切换门禁）
 - **所属模型**: 模型四 Tracker
 - **策略配置**: `strategies/04-bloom.json`
 - **核心目标**: 对模型二发现的股票进行信号质量判断和跨日生命周期跟踪，输出观察状态、风险阻断、估值候选和下一步观察点。
@@ -79,6 +79,8 @@ structure_valid
 structure_invalid_reason
 reason
 ```
+
+Quant评分口径由`structure_score_policy_id`声明，Bloom状态和事件保存该ID与`quant_strategy_version`。跨口径（含旧记录缺ID）时`score_change`留空、`structure_score_policy_changed=true`，不因分数断点产生UPGRADE/DOWNGRADE；当日结构阶段、真实失效、风险与买点仍按原规则处理。最佳分数按新口径重新建立，旧历史快照不回写；同口径恢复正常分差计算，数值0是有效分数。缺数/缺席跟踪行保留原评分ID，不冒充新策略计算。
 
 Bloom 可读取自身历史状态：
 

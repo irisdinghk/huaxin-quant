@@ -60,12 +60,12 @@ class SyncZixuanTargetTests(unittest.TestCase):
         ), "2026-08-20")
         self.assertEqual(result["selection"], "FOCUS")
 
-    def test_forming_requires_score_70(self):
+    def test_forming_requires_score_60(self):
         self.assertIsNone(target_row(sample_row(
-            bloom_status="FORMING", structure_score="69.99",
+            bloom_status="FORMING", structure_score="59.99",
         ), "2026-08-20"))
         result = target_row(sample_row(
-            bloom_status="FORMING", structure_score="70",
+            bloom_status="FORMING", structure_score="60",
         ), "2026-08-20")
         self.assertEqual(result["selection"], "FOCUS")
 

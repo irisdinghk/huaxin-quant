@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scripts.data.pool_data import PoolSegmentCache, find_key, parse_date, parse_num, parse_pct
 from scripts.data.pool_expansion import build_expansion_pool
 from scripts.data.market_data_store import DB_PATH as MARKET_DB_PATH
-from scripts.data.pool_tracking import EXITED, prepare_tracking_rows
+from scripts.data.pool_tracking import EXITED, has_active_structure, prepare_tracking_rows
 from scripts.data.strategy_data_store import (
     connect as connect_strategy_db,
     load_latest_bloom_state_before,
@@ -413,7 +413,7 @@ fieldnames = [
     "20日涨幅_pct","60日涨幅_pct","20日平均成交额_元",
     "历史交易日数","最近20日有效交易日数",
     "RS当日入选","跟踪状态","首次跟踪日","最近RS入选日",
-    "观察期已用交易日","观察期剩余交易日","跟踪来源",
+    "观察期已用交易日","观察期剩余交易日","跟踪来源","成交额门槛豁免",
     "strategy_version",
 ]
 
@@ -502,12 +502,14 @@ for code in sorted(final):
         "观察期已用交易日": "",
         "观察期剩余交易日": "",
         "跟踪来源": "",
+        "成交额门槛豁免": "",
         "strategy_version": STRATEGY_VERSION,
     })
 
 tracking_enabled = bool(TRACKING_CFG.get("enabled", False))
 previous_tracking = {}
 bootstrap_codes = set()
+bootstrap = {}
 if tracking_enabled:
     with connect_strategy_db() as strategy_conn:
         previous_tracking = load_latest_pool_tracking_before(strategy_conn, TODAY.isoformat())
@@ -521,11 +523,18 @@ tracked_codes = {
     code for code, state in previous_tracking.items()
     if state.get("tracking_status") != EXITED
 } | bootstrap_codes
+liquidity_exempt_codes = set()
+if tracking_enabled and TRACKING_CFG.get("exempt_active_structure_from_liquidity", False):
+    liquidity_exempt_codes = {
+        code for code in tracked_codes
+        if has_active_structure(previous_tracking.get(code) or bootstrap.get(code) or {})
+    }
 expansion_rows, expansion_summary = build_expansion_pool(
     TODAY.isoformat(),
     EXPANSION_CFG,
     core_codes=set(final),
     tracked_codes=tracked_codes,
+    liquidity_exempt_codes=liquidity_exempt_codes,
 )
 tracking_by_code = {}
 if tracking_enabled:
@@ -589,6 +598,7 @@ for expansion in expansion_rows:
         "观察期已用交易日": str(tracking.get("grace_trade_days", 0)) if tracking else "0",
         "观察期剩余交易日": str(tracking.get("grace_remaining_days", 0)) if tracking else "",
         "跟踪来源": tracking.get("tracking_source", "RS") if tracking else "RS",
+        "成交额门槛豁免": "Y" if expansion.get("liquidity_filter_exempt") else "N",
     })
 
 rows_out.sort(key=lambda row: str(row["股票代码"]))
@@ -630,6 +640,7 @@ if expansion_summary.get("enabled"):
         )
         print(f"    - 当日RS入选: {sum(bool(row.get('rs_current_eligible')) for row in tracking_by_code.values())} 只")
         print(f"    - 结构跟踪: {tracking_counts.get('STRUCTURE_TRACKED', 0)} 只")
+        print(f"    - 成交额豁免保留: {expansion_summary.get('liquidity_exempt_total', 0)} 只")
         print(f"    - 观察期保留: {tracking_counts.get('GRACE_TRACKING', 0)} 只")
         print(f"    - 观察期满退出: {grace_exits} 只")
         print(f"    - 硬过滤退出: {hard_exits} 只")

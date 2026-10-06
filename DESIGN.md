@@ -1,12 +1,14 @@
 # Huaxin Quant Design
 
-最近核对：2026-09-08。本文描述当前实现；未实现的改进见 [TODO](TODO.md) 和 [工程与策略改进路线图](docs/IMPROVEMENT_ROADMAP.md)。模块阈值以配套指令卡和策略 JSON 为准，本文件不重复维护阈值表。
+最近核对：2026-09-30（总控、数据读写与发布路径、配置和近期变更）。本文描述当前实现；未实现的改进见 [TODO](TODO.md) 和 [工程与策略改进路线图](docs/IMPROVEMENT_ROADMAP.md)。模块阈值以配套指令卡和策略 JSON 为准，本文件不重复维护阈值表。
 
 ## 1. 目标与当前边界
 
 Huaxin Quant 是面向 A 股的候选发现、信号跟踪和研究复盘系统。日常链路已经覆盖数据准备、双池筛选、VCP、生命周期、次日计划、市场与资金环境、回测及页面发布。它尚未形成账户级自动交易系统，也未完成当前版本买点的独立样本外验证。
 
 脚本决定结构、信号、评分、状态和计算结果；LLM 解释受约束的事实，并完成按需机构共识研究。LLM 失败不能补造数据；不同模块的发布门禁见 WORKFLOW。
+
+当前 Quant 的 LLM 入口已暂停，Bloom 与 Signal Plan 的 reporting.llm_enabled 均为 false，使用确定性文本；市场解读及按需估值研究仍保留 LLM。AI Daily Report 只汇总已发布数据，不新增研究调用。人工投研独立于自动链路，先读原计划与研究记录、复用本地数据，具体约束见 [AGENTS](AGENTS.md)。
 
 ## 2. 源码与运行实例
 
@@ -25,11 +27,11 @@ Huaxin Quant 是面向 A 股的候选发现、信号跟踪和研究复盘系统�
 | 模块 | 主要输入 | 主要职责与下游 |
 |---|---|---|
 | Market Data | 通达信、妙想备用数据 | 原始日线、证券母体、板块快照、独立公司行为；供 Market、Pool、Quant 等复用 |
-| Pool | 财务筛选缓存、全 A 日线 | 核心质量池与 RS 扩展池合并，供 Quant 扫描；扩展独有标的财务未核验 |
+| Pool | 财务筛选缓存、全 A 日线、前日已收口候选状态 | 核心质量池与 RS 扩展池合并，跨日保留有效结构和重建观察；扩展独有标的财务未核验 |
 | Quant | 当日 Pool、时点前复权行情 | 单日 VCP 结构、三类买点、评分、风险和突破后上下文 |
 | Bloom | Quant、既有生命周期 | 跨日状态、事件、重点观察与估值候选标记 |
 | Signal Plan | Quant 的 setup_plan_inputs | 次日条件计划；不补造模型二当日信号 |
-| Market Regime | 共享原始行情与板块快照 | 宽基、广度、板块阶段、主线解释；不回写 Quant |
+| Market Regime | 共享原始行情、板块快照及事件检索 | 宽基、广度、板块阶段与主线解释；行情强势候选和已核验事件主线分开，不回写 Quant |
 | Capital Observer | 成交额与资金数据 | 独立资金事实和解释；不参与模型二评分 |
 | Signal Fundamentals | 当日信号、计划和 Pool | 补查扩展独有股票财务，提供非阻断风险提示 |
 | Dashboard Signals | Quant、Plan、市场/板块及旁路提示 | 展示当日买点与次日计划；当前环境仓位提示在此适配器计算 |
@@ -40,7 +42,7 @@ Huaxin Quant 是面向 A 股的候选发现、信号跟踪和研究复盘系统�
 | AI Daily Report | 已发布市场/资金/VCP/信号包 | 确定性汇总 JSON，不调用新 LLM |
 | Watchlist Sync | Bloom 与模型二买点、受管自选账本 | 可选外部自选同步，保留手工自选 |
 
-`daily.py` 是每日总控，直接调用 Bloom 和 Plan。`tracker.py` 是按需生成两者合并日报的工具；不调度估值或持仓，不替代 daily。
+`daily.py` 是每日总控，直接调用 Bloom 和 Plan 的独立 CLI。`tracker.py` 是按需旧编排入口：读取兼容 Quant JSON，重新调用 Bloom/Plan 函数并写兼容文件，再生成合并日报；它不是只读合并，也未调用独立 CLI 的数据库提交与候选收口流程，不调度估值或持仓，不能替代 daily 或用于修复权威策略状态。
 
 ## 4. 数据、规则、状态与展示
 
@@ -61,14 +63,16 @@ Huaxin Quant 是面向 A 股的候选发现、信号跟踪和研究复盘系统�
 | 数据 | 权威来源 | 兼容/展示产物 |
 |---|---|---|
 | 原始日线与公司行为 | cache/market_data/market_data.sqlite | 按需行情窗口及审计字段 |
-| Quant、Plan、Bloom、兑现与生命周期 | cache/strategy/strategy_data.sqlite | quant CSV、quant_runs JSON、Bloom 状态文件、Plan JSON/Markdown |
+| Pool 候选跟踪、Quant、Plan、Bloom、兑现与生命周期 | cache/strategy/strategy_data.sqlite | Pool CSV、quant CSV、quant_runs JSON、Bloom 状态文件、Plan JSON/Markdown |
 | 市场派生状态 | cache/market_regime/market_regime.sqlite 及模块发布产物 | market/、Dashboard 市场包 |
 | 资金 | cache/capital_flow/capital_data.sqlite | capital/、Dashboard 资金包 |
 | 宏观 | cache/global_macro/global_macro.sqlite | macro/ 健康与采集摘要 |
 | 真实交易 | position/trades/ 与 position_plan.csv | lots_current、日快照、年度表现 |
 | 估值研究 | cache/valuation_runs/<run_id>/ 已验证运行包 | 报告、索引、排名和公司页 |
 
-核心策略模块先提交数据库，再发布兼容文件；同日内容变化保留修订，current_documents 指向当前版本。旧文件只作兼容或迁移回退。历史修订存在，不等于已冻结回测使用的全部代码、配置和输入版本。
+每日主链路中的核心策略模块先提交数据库，再发布兼容文件；同日内容变化保留修订，current_documents 指向当前版本。旧文件只作兼容或迁移回退；Tracker 的旧文件写入路径不具备同等提交保证。历史修订存在，不等于已冻结回测使用的全部代码、配置和输入版本。
+
+Quant 全量运行落库的是成功处理标的的完整结果，CSV 默认仅发布纳入展示的标的。单股/多股运行写专用文件，不覆盖全量策略文档。总控的产物核验通过不代表每只 Pool 股票均成功，也不代表复权核验全部通过；个股缺口仍以 Quant stats 和数据状态为依据。
 
 ## 6. 日期与价格口径
 

@@ -11,6 +11,28 @@ GRACE = "GRACE_TRACKING"
 EXITED = "EXITED"
 
 
+def has_active_structure(state: dict) -> bool:
+    """Use prior structure evidence, not mere membership in the tracking ledger."""
+    if state.get("tracking_status") in {EXITED, GRACE}:
+        return False
+    if state.get("structure_valid") is False:
+        return False
+    if str(state.get("bloom_status") or "").upper() in {"INVALID", "EXIT"}:
+        return False
+    post_state = str(state.get("post_breakout_state") or "").upper()
+    if post_state and post_state != "PRE_BREAKOUT":
+        return post_state in {
+            "POST_BREAKOUT_HOT", "POST_BREAKOUT_RETEST", "POST_BREAKOUT_CONSOLIDATING"
+        }
+    if str(state.get("bloom_status") or "").upper() == "DATA_ISSUE":
+        return bool(state.get("liquidity_structure_active"))
+    stage = str(
+        state.get("quant_stage") or state.get("model2_stage")
+        or state.get("structure_stage") or ""
+    ).upper()
+    return stage in {"VCP_EARLY", "VCP_FORMING", "VCP_MATURE", "VCP_TIGHT"}
+
+
 def prepare_tracking_rows(
     trade_date: str,
     candidates: Iterable[dict],
@@ -77,6 +99,10 @@ def prepare_tracking_rows(
             "bloom_status": prior.get("bloom_status"),
             "post_breakout_state": prior.get("post_breakout_state"),
             "exit_reason": exit_reason,
+            "liquidity_filter_exempt": bool(candidate.get("liquidity_filter_exempt")),
+            "liquidity_structure_active": (
+                has_active_structure(prior) or bool(candidate.get("liquidity_structure_active"))
+            ),
             "strategy_version": strategy_version,
             "_prior_tracking_status": prior.get("tracking_status"),
             "_prior_grace_start_date": prior.get("grace_start_date"),
@@ -99,6 +125,7 @@ def finalize_tracking_rows(
     finalized = []
     for source in rows:
         row = dict(source)
+        prior_structure_active = has_active_structure(row) or bool(row.get("liquidity_structure_active"))
         code = row["code"]
         quant = quant_rows.get(code) or {}
         bloom = bloom_rows.get(code) or {}
@@ -143,6 +170,11 @@ def finalize_tracking_rows(
             row["grace_remaining_days"] = grace_limit
             row["exit_reason"] = None
 
+        row["liquidity_structure_active"] = (
+            prior_structure_active
+            if bloom_status == "DATA_ISSUE" and retain_data_issue
+            else has_active_structure(row)
+        )
         row["resolution_status"] = "FINAL"
         for key in [key for key in row if key.startswith("_prior_")]:
             row.pop(key, None)

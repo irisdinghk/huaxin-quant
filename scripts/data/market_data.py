@@ -28,6 +28,18 @@ from scripts.shared import PROJECT_ROOT, RateLimiter
 MX_BASE_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/query"
 MAX_RETRIES = 3
 
+TDX_DECODED_ZERO = 2.0 ** -127
+
+
+def normalize_tdx_decoded_zeros(frame: pd.DataFrame) -> pd.DataFrame:
+    """tdxpy decodes a packed zero quantity as 2**-127 rather than zero."""
+    data = frame.copy()
+    for column in ("vol", "volume", "amount"):
+        if column in data:
+            values = pd.to_numeric(data[column], errors="coerce")
+            data.loc[values == TDX_DECODED_ZERO, column] = 0.0
+    return data
+
 # 字段别名：整合 quant_filter 的精确匹配 + tracker 的模糊匹配
 # 按优先级排列，先精确后模糊
 FIELD_GROUPS = [
@@ -394,7 +406,8 @@ class TDXSource(DataSource):
         if raw is None or raw.empty:
             return None, "TDX 返回空数据"
 
-        # 过滤停牌日（volume=0，量价均为 0 的无交易行）
+        raw = normalize_tdx_decoded_zeros(raw)
+        # Zero-activity placeholders are not effective trading sessions.
         normal = raw[raw["volume"] > 0].copy()
         if normal.empty:
             return None, "TDX 无有效交易日（可能长期停牌）"

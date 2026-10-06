@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from scripts.data.pool_expansion import build_expansion_pool
+from scripts.data.pool_tracking import STRUCTURE, has_active_structure, prepare_tracking_rows
 
 
 class PoolExpansionTest(unittest.TestCase):
@@ -115,6 +116,58 @@ class PoolExpansionTest(unittest.TestCase):
         self.assertEqual(by_code["000004"]["hard_filter_reason"], "")
         self.assertEqual(summary["initial_top_total"], 2)
         self.assertEqual(summary["tracked_metrics_total"], 1)
+
+    def test_low_amount_structure_stays_in_pool_without_new_rs_eligibility(self):
+        prior = {"000003": {
+            "tracking_status": STRUCTURE, "quant_stage": "VCP_FORMING",
+            "bloom_status": "FORMING", "first_seen_date": self.dates[0],
+        }}
+        exempt_codes = {code for code, state in prior.items() if has_active_structure(state)}
+        for top_n in [2, 3]:
+            with self.subTest(top_n=top_n):
+                rows, summary = build_expansion_pool(
+                    self.as_of, self.config(top_n), tracked_codes=set(prior),
+                    db_path=self.db_path, liquidity_exempt_codes=exempt_codes,
+                )
+                row = next(row for row in rows if row["code"] == "000003")
+                self.assertEqual(row["average_amount_20"], 10.0)
+                self.assertEqual(row["hard_filter_reason"], "")
+                self.assertTrue(row["liquidity_filter_exempt"])
+                self.assertFalse(row["rs_current_eligible"])
+                self.assertEqual(summary["liquidity_exempt_total"], 1)
+                pending = prepare_tracking_rows(self.as_of, [row], prior, self.dates, 20)[0]
+                self.assertEqual(pending["tracking_status"], STRUCTURE)
+                self.assertTrue(pending["liquidity_filter_exempt"])
+
+    def test_first_discovery_cannot_claim_structure_liquidity_exemption(self):
+        rows, summary = build_expansion_pool(
+            self.as_of, self.config(3), db_path=self.db_path,
+            liquidity_exempt_codes={"000003"},
+        )
+        self.assertNotIn("000003", {row["code"] for row in rows})
+        self.assertEqual(summary["rejected"]["LOW_LIQUIDITY"], 1)
+        self.assertEqual(summary["liquidity_exempt_total"], 0)
+
+    def test_structure_exemption_does_not_override_other_hard_filters(self):
+        rows, _ = build_expansion_pool(
+            self.as_of, self.config(3), tracked_codes={"000001"},
+            db_path=self.db_path, liquidity_exempt_codes={"000001"},
+        )
+        st = next(row for row in rows if row["code"] == "000001")
+        self.assertEqual(st["hard_filter_reason"], "ST")
+        self.assertFalse(st["liquidity_filter_exempt"])
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM daily_bars WHERE code='000003' AND trade_date=?", (self.as_of,))
+        conn.commit()
+        conn.close()
+        rows, _ = build_expansion_pool(
+            self.as_of, self.config(3), tracked_codes={"000003"},
+            db_path=self.db_path, liquidity_exempt_codes={"000003"},
+        )
+        missing = next(row for row in rows if row["code"] == "000003")
+        self.assertEqual(missing["hard_filter_reason"], "TARGET_DATE_MISSING")
+        self.assertFalse(missing["liquidity_filter_exempt"])
 
 
 if __name__ == "__main__":

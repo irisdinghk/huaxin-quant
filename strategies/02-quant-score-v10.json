@@ -1,0 +1,97 @@
+{
+  "strategy_version": "model2_quant_score_v10",
+  "research_only": false,
+  "stage_scores": {
+    "VCP_EARLY": 15,
+    "VCP_FORMING": 25,
+    "VCP_MATURE": 35,
+    "VCP_TIGHT": 40
+  },
+  "impulse_selection": {
+    "enabled": true,
+    "lookback_days": 60,
+    "diagnostic_lookback_days": [
+      30
+    ],
+    "base_swing_window": 3,
+    "min_up_mean_volume_ratio": 1,
+    "same_peak_base": "coverage_nearest",
+    "min_advance_coverage": 0.7
+  },
+  "quality_curve": "sqrt",
+  "retention_curve": "quadratic_drawback",
+  "extension_score_overrides": {
+    "CONFIRMED_RESET_CONTRACTION": 3
+  },
+  "contraction_quality_bonus": {
+    "enabled": true,
+    "score": 6
+  },
+  "terminal_micro_bonus": {
+    "enabled": true,
+    "score": 6,
+    "min_days": 2,
+    "max_days": 5,
+    "min_pivot_distance_pct": -15,
+    "max_pivot_distance_pct": 1
+  },
+  "budget": {
+    "structure": 40,
+    "volume": 20,
+    "impulse": 30,
+    "trend": 5,
+    "position": 5,
+    "extension": 12,
+    "contraction_quality": 6
+  },
+  "legacy_caps": {
+    "structure": 55,
+    "volume": 30,
+    "trend": 15,
+    "position": 22
+  },
+  "quality_weights": {
+    "gain_pct": 0.4,
+    "up_volume_ratio": 0.2,
+    "up_down_volume_ratio": 0.2,
+    "path_efficiency": 0.15,
+    "speed_pct": 0.05
+  },
+  "calibration": {
+    "quantile": 0.9,
+    "min_samples": 20,
+    "floors": {
+      "gain_pct": 0,
+      "up_volume_ratio": 1,
+      "up_down_volume_ratio": 1,
+      "speed_pct": 0
+    }
+  },
+  "baseline_volume_days": 20,
+  "setup_conversion": "normalize_total_to_100",
+  "execution_purpose": "production",
+  "parameter_id": "impulse_v10_cal_20260915_repaired333",
+  "frozen_calibration": {
+    "calibration_date": "2026-09-15",
+    "sample_count": 333,
+    "source_calibration_sha256": "3ffbcb3f56ee14321a24e6dbe44eb74b9c14b4a9ddbd77dced97cddd35d64077",
+    "mappings": {
+      "gain_pct": {
+        "floor": 0,
+        "cap": 76.83160803926891
+      },
+      "up_volume_ratio": {
+        "floor": 1,
+        "cap": 3.629055000000001
+      },
+      "up_down_volume_ratio": {
+        "floor": 1,
+        "cap": 1.855851470739511
+      },
+      "speed_pct": {
+        "floor": 0,
+        "cap": 5.627081911784335
+      }
+    }
+  }
+}

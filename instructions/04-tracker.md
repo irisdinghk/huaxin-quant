@@ -1,7 +1,7 @@
 # 模型四：Tracker 总控指令卡
 
 - **版本管理**: 由 Git 分支与提交历史管理
-- **最近更新**: 2026-09-08（文档对齐，策略不变）
+- **最近更新**: 2026-09-30（核对旧入口实际读写，策略不变）
 - **策略配置**: `strategies/04-tracker.json`
 - **核心目标**: 模型四是多个独立信号模块的统一编排层。tracker 本身不做信号判断、不拉数据、不算指标，只负责调度子模块运行 + 生成合并日报。
 
@@ -40,7 +40,9 @@ tracker 内部流程：
 4. 读两边 dict，交叉合并 → 写 tracker/花期策览_<date>.md
 ```
 
-tracker 不重复计算，不修改子模块逻辑。子模块仍可独立运行。
+tracker 不另设算法，但会重新调用子模块计算并写出文件；子模块仍可独立运行。
+
+当前旧入口直接读取 Quant 兼容 JSON，并调用 Bloom/Plan 函数，不经过二者独立 CLI 的策略文档落库与 Pool 候选收口流程。它会写 Bloom 状态和事件兼容文件、Plan 文件及合并报告，不是只读合并；这些文件更新不代表权威策略库同步更新。正式每日流程使用 daily 调用独立 CLI；恢复已提交结果的兼容文件使用 strategy_publish。Tracker 与策略库的一致性改造仍待完成，不在本次文档核对中改变脚本行为。
 
 `tracker.py` 保留为按需生成合并日报的独立工具，不属于每日默认工作流。每日默认工作流由 `daily.py` 在 Bloom、Signal Plan 后继续执行完整资金观测、信号股资金补查、页面发布、AI研读数据包与自选重建：
 
@@ -80,7 +82,7 @@ AI研读数据包必须在市场、资金、VCP、信号四类 Dashboard 数据�
 
 ## 四、输入
 
-核心策略权威存储为 cache/strategy/strategy_data.sqlite，子模块优先读取已提交文档与状态；下列文件保留兼容入口。Tracker 不另维护一份权威生命周期，见 [strategy-data.md](strategy-data.md)。
+核心策略权威存储为 cache/strategy/strategy_data.sqlite，独立 CLI 优先读取已提交文档与状态；当前 Tracker 的 Quant 输入仍直接读取下列兼容文件，不能把其文件输出当作新提交的权威记录。Bloom 函数可能读取已有数据库状态，但 Tracker 不提交本轮权威文档与生命周期，见 [strategy-data.md](strategy-data.md)。
 
 
 ```text

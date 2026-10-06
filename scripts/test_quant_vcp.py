@@ -30,6 +30,13 @@ def make_frame(closes, highs=None, lows=None):
 
 
 class CloseBasedContractionTests(unittest.TestCase):
+    def setUp(self):
+        # These fixtures preserve the legacy detector/score contracts; production
+        # V10 integration and frozen mappings have their own regression suite.
+        legacy = patch.object(quant, "STRUCTURE_SCORING_CFG", None)
+        legacy.start()
+        self.addCleanup(legacy.stop)
+
     def test_confirmed_breakout_consumes_old_contractions_before_new_vcp(self):
         df = quant.calc_indicators(make_frame([100.0] * 80))
         contractions = [

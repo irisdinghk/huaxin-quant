@@ -1,6 +1,7 @@
 # 自选股同步指令卡
 
 - **所属模块**: 模型四 Tracker
+- **最近更新**: 2026-10-06（FORMING同步门槛降至60分）
 - **数据源**: Bloom 状态 + 东方财富妙想自选管理 Skill
 - **核心目标**: 每日用 Bloom 的重点观察和已触发买点刷新系统管理的自选股，不触碰用户手工维护的其他自选股。
 
@@ -37,7 +38,7 @@ Bloom 最终状态是目标集合的权威口径。先排除
 model2_setup_signal=PULLBACK_BUY / BREAKOUT_BUY / RETEST_BUY
 bloom_status=TRIGGERED
 bloom_status=MATURE
-bloom_status=FORMING，且 structure_score >= 70
+bloom_status=FORMING，且 structure_score >= 60
 bloom_status=EARLY，且 structure_score >= 75
 bloom_status=COOLDOWN，post_breakout_state=POST_BREAKOUT_HOT / POST_BREAKOUT_RETEST / POST_BREAKOUT_CONSOLIDATING，且 structure_breakout_score >= 60
 ```

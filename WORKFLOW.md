@@ -1,6 +1,6 @@
 # Huaxin Quant Workflow
 
-最近核对：2026-09-08。本文定义当前执行流程；架构见 [DESIGN](DESIGN.md)，待实现方案见 [改进路线图](docs/IMPROVEMENT_ROADMAP.md)。
+最近核对：2026-09-30（daily 总控、配置、发布与核验分支，并对照当日产物）。本文定义当前执行流程；架构见 [DESIGN](DESIGN.md)，待实现方案见 [改进路线图](docs/IMPROVEMENT_ROADMAP.md)。
 
 已有双目录实例必须在 runtime-workspace 执行以下命令，Git 始终使用 `git -C <source-repo>`。未激活虚拟环境时显式使用 `.venv/bin/python scripts/...`。
 
@@ -21,25 +21,40 @@ python3 --version
 python3 scripts/daily.py &
 ```
 
-每日总控使用 `.tmp/locks/daily.lock` 防止两个运行实例同时改写共享状态。若已有实例运行，第二次启动会直接失败并显示锁持有者信息。每个子阶段默认最多运行 6 小时，可通过 `.env` 的 `HUAXIN_STAGE_TIMEOUT_SECONDS` 调整；超时按阻断失败处理。
+每日总控使用运行工作区的 `.tmp/locks/daily.lock` 防止同一工作区内并发总控改写状态；不同工作区不共享这把锁。若锁已被占用，第二次启动会直接失败并显示锁持有者信息。每次子进程调用默认最多运行 6 小时，可通过 `.env` 的 `HUAXIN_STAGE_TIMEOUT_SECONDS` 调整；超时返回 124，再按该阶段重试和失败规则处理。打开面板单独使用 30 秒超时。
 
 带选项：
 
 ```bash
 python3 scripts/daily.py --date 260709 &         # 指定日期
 python3 scripts/daily.py --skip-pool &            # 复用已有池子，跳过模型一
-python3 scripts/daily.py --force-refresh &        # 强制刷新数据缓存
+python3 scripts/daily.py --force-refresh &        # 将强制刷新参数传给 Pool
 ```
 
-启动后立即返回，不阻塞当前终端。流水线在后台按顺序执行：
+使用上述 `&` 后启动即返回；总控在后台串行执行以下 12 个进度阶段：
 
-```text
-市场数据增量更新 → 模型一 Pool（合并跨日候选） → 模型二 Quant → Bloom 信号（收口候选生命周期） → Signal Plan → 信号财务提示 → 当天完整资金观测 → 市场/回测/VCP 页面发布 → 信号股资金补查与信号页面发布 → AI 研读数据包 → 产物完整性核验 → 打开本地面板 → 东方财富自选同步（可选）
-```
+| 阶段 | 实际动作 |
+|---|---|
+| data_update | Market Regime update，准备共享行情和快照 |
+| pool | Pool 筛选及跨日候选合并；`--skip-pool` 时复用文件 |
+| quant | 全量 Quant 结构与触发计算，提交策略库 |
+| bloom | 生命周期落库及候选收口，暂不发布页面 |
+| signal_plan | 次日计划计算、落库及文件发布 |
+| signal_fundamentals | 信号财务补查，失败为非阻断降级 |
+| capital_observer | 当日完整资金观测，显式启用 `--fetch` |
+| dashboard | 市场发布 → 回测 → VCP 页面 → 信号股资金补查及信号页面 |
+| ai_daily_report | 汇总四类页面包，生成确定性研读 JSON |
+| verify | 同日产物、索引、市场 LLM、资金补取及候选收口核验 |
+| open_dashboard | 打开本地面板，失败为非阻断降级 |
+| zixuan | 启用时同步系统受管自选，保留用户手工自选 |
+
+当前 Quant、Bloom 和 Signal Plan 的 LLM 文字解读已暂停，输出使用确定性文本；Quant 的 `--with-llm` 也会跳过，Bloom/Plan 由各自配置的 `reporting.llm_enabled=false` 控制。此暂停不涉及下述市场 LLM 门禁，也不涉及用户主动触发的模型三研究。
+
+完整资金观测采用模块策略的请求预算；信号页面另以 `--fetch-capital --max-mx-requests 5` 补查信号股。达到本地请求预算不等于外部接口限流，两个补查任务不能互相替代。
 
 日常市场发布必须启用市场 LLM 解读；`market_regime_<YYMMDD>.json` 中 `llm.status=success`、解读正文非空，且页面 `analysis_source=llm` 后才算完成。市场 LLM 首次失败时允许自动重跑市场发布，但必须复用已经生成的“今日盘面主线”，不得重复检索或改写主线结论。`--no-llm` 只用于显式历史回放和开发调试，不能进入每日完整工作流。
 
-市场数据更新、完整资金观测、只读页面发布和自选集合重建属于可重入阶段，遇到瞬时失败时允许有限次数自动重试。Pool、Quant、Bloom、Signal Plan 会生成筛选结果或生命周期账本，不得由总控盲目重复执行；失败时必须以 `failed` 终态中止，等待明确续跑。任何关键阶段失败、市场 LLM 未成功或同日产物核验不完整时，总进度不得标记为 `done`。
+总控对数据更新、完整资金观测、回测/VCP/信号发布、AI 研读包和受管自选同步使用有限重试，默认最多两次调用；其中回测和自选同步有状态写入，不能统称为只读发布。市场发布有独立的保留主线重试。Pool、Quant、Bloom、Signal Plan 不由总控盲目重复执行；其阻断失败会中止流程，Bloom/Plan 的解释降级例外见异常处理。任何关键阶段失败、市场 LLM 未成功或同日产物核验不完整时，总进度不得标记为 `done`。
 
 Pool 的扩展通道读取策略库中严格早于当日的候选跟踪状态，将仍处于有效结构或20日重建观察期的股票并入当日 CSV。Bloom 保存当日状态后把候选跟踪快照从 `PENDING` 更新为 `FINAL`，供下一交易日使用；因此完整工作流结束时不允许遗留当日 `PENDING` 行。
 
@@ -54,7 +69,9 @@ monitor 每 2 秒刷新一次，机器进度写入 `.tmp/daily_progress_<YYMMDD>
 - **运行中**：显示阶段状态 + 进度条（模型二含逐只股票进度）
 - **完成后**：保留最终阶段结果，包含市场、资金、VCP、信号、回测及 AI 日报产物的日期一致性核验，monitor 退出
 
-进度终态分为：`done`（完整完成）、`degraded`（核心产物完成但非阻断能力降级）和 `failed`（阻断失败）。明确关闭的可选步骤记为 `skipped`，不再伪装成成功执行，也不会让 monitor 把已完成流水线误判为失败。
+进度终态分为：`done`（通过总控门禁）、`degraded`（核心产物完成但有阶段明确标记降级）和 `failed`（阻断失败）。自选同步关闭时记为 `skipped`；当前 `--skip-pool` 分支仍将 Pool 步骤记为 `done`，应结合命令确认是否真正执行。
+
+资金观测的 `partial` 会记录明细并允许继续，当前总控不会仅因此标记 `degraded`。Quant 的个股处理失败或复权未完全核验也不直接触发总控降级；阅读 `cache/quant_runs/quant_<YYMMDD>.json` 的 stats、结果及数据状态，不能以总状态 `done` 代替个股覆盖核验。产物核验检查必需文件、索引和特定元数据，并非对每个包、每只股票的完整语义校验。
 
 ```bash
 python3 scripts/monitor.py --date 260709         # 指定日期
@@ -65,7 +82,11 @@ Ctrl+C 可随时退出 monitor，流水线继续在后台运行。重新连接�
 
 ## 历史日期与重跑边界
 
+2026-09-30起正式结果与页面切换至Quant v36的V10结构评分、Bloom v7口径衔接；Signal Plan沿用v9规则，消费新Quant结构分。此次切换发布已验收的独立工作流结果，不重复取数或重跑历史总控。切换日前快照保留原口径；旧的9月30日结果保留文档修订和发布前备份，历史回测仍包含旧策略样本。
+
 `daily.py --date` 会重新执行包含取数与状态写入的主链路，不等于只读回测或严格点时回放。当前默认日期只处理 15:00 与周末回退，节假日需核对实际交易日；核心池财务缓存也不具备完整点时门禁。不要用今天查询的财务数据证明历史选股结果。
+
+不带 `--date` 的 `--skip-pool` 在默认日期没有 Pool 文件时，会把整条流水线日期回退到最近已有 Pool；明确指定日期且该日 Pool 缺失时直接失败。复用池子前必须确认运行日期，不能把回退产物当作今天的结果。`--force-refresh` 仅传给 Pool，不等于强制刷新所有模块。
 
 仅重建兼容文件时使用 `scripts/strategy_publish.py all --date <YYMMDD>`，它读取已提交的策略数据库；刷新历史市场环境使用下文隔离回放工具。历史生命周期重算需另行隔离状态，不能把生产账本当作实验目录。
 
@@ -85,12 +106,22 @@ python3 scripts/sync_zixuan.py --date 260709 --yes
 
 各模块也可独立运行，详见 `instructions/` 目录下各指令卡。
 
+调试示例不是补齐今日流程的替代命令集；直接运行 `dashboard_signals.py` 未带 `--fetch-capital` 不满足正式日流程门禁。`sync_zixuan.py --yes` 会实际修改外部受管自选，文档审查不执行此命令。
+
+Tracker 的旧入口会调用 Bloom/Plan 函数重算并写兼容文件，不是只读拼接报告，也未完成独立 CLI 的策略库提交和候选收口；不得用它替代 daily 或重建权威状态。兼容文件恢复使用上文 `strategy_publish.py`，具体边界见 [Tracker 指令](instructions/04-tracker.md)。
+
 市场或板块状态规则升级后，使用隔离历史回放刷新派生环境，不重新运行 Quant、Bloom、Signal Plan 或 LLM：
 
 ```bash
 python3 scripts/rebuild_market_history.py
 python3 scripts/rebuild_market_history.py --publish
 ```
+
+## 盘后人工研究
+
+系统执行与人工研究是两条流程。研究先回顾最近的 `daily_research/` 笔记和 `position/current_holdings_discussion.csv`，核对原计划；随后检查目标日行情与系统产物覆盖，复用本地共享行情库和策略库。数据完整且无具体疑点时，直接研究，不因新一轮讨论重跑总控或重复调用外部行情。
+
+候选初筛按 [opportunity-screening.md](instructions/opportunity-screening.md)，讨论后合并到当日研究笔记。补查条件、数据口径、分时证据边界和持仓事实优先级统一按 [AGENTS](AGENTS.md) 第7—9节；人工研究不自动写成交、改策略或触发自选同步。
 
 ## 独立执行模型三估值分析
 
@@ -206,10 +237,10 @@ python3 scripts/run_valuation.py --code 300442 --no-publish
 
 | 层级 | 文件 | 说明 |
 |------|------|------|
-| 策略库 | `cache/strategy/strategy_data.sqlite` | Quant、Plan、Bloom、兑现事件与生命周期的权威存储 |
+| 策略库 | `cache/strategy/strategy_data.sqlite` | Pool 候选跟踪、Quant、Plan、Bloom、兑现事件与生命周期的权威存储 |
 | 模型一 | `pool/pool_<YYMMDD>.csv` | 核心质量与 RS 扩展合并候选池 |
-| 模型二 | `quant/quant_<YYMMDD>.csv` | 单日量价结构 |
-| 模型二 | `cache/quant_runs/quant_<YYMMDD>.json` | 策略库的兼容结构化结果（Bloom / Plan 消费） |
+| 模型二 | `quant/quant_<YYMMDD>.csv` | 默认仅含纳入展示的标的，不是全量研究输入 |
+| 模型二 | `cache/quant_runs/quant_<YYMMDD>.json` | 策略库的兼容全量结果及统计；Bloom / Plan 优先读数据库，文件作回退 |
 | Bloom | `bloom/bloom_<YYMMDD>.md` | Bloom 日报 |
 | Bloom | `bloom/state/bloom_state.csv` | 跨日状态表 |
 | Bloom | `bloom/state/bloom_events.jsonl` | 事件流水 |
@@ -236,7 +267,7 @@ python3 scripts/init_runtime.py
 - 市场 LLM 状态不是 `success`、正文为空或页面没有标记 `analysis_source=llm` → 市场发布未完成；总控复用既有盘面主线重试，仍失败则中止
 - 完整资金观测达到请求预算或部分数据源失败时允许以 `partial` 产物继续，但同日资金归档、Dashboard 数据包和资金日期索引不得缺失；信号页面必须确认已启用信号股资金补查。
 - `daily.py` 不带 `--date` 时，按 15:00 分界线选择预期最近交易日；带 `--date` 时，所有阶段和市场、资金、VCP、信号、回测及 AI 日报产物包均使用该日期，可用于按日回补。
-- Bloom / Signal Plan LLM 调用失败（退出码 3）→ 保留规则产物，继续执行后续阶段
+- Bloom / Signal Plan 在重新启用 LLM 后调用失败（退出码 3）→ 保留规则产物，阶段标记 `degraded` 并继续；当前配置暂停调用，`skipped/disabled` 不构成降级
 - 模型三的 mx-data、证据检索、LLM、研究卡或参数门禁失败 → 本次估值显式失败并保留运行包，使用 `--status` 查看原因、`--resume` 断点续跑；不得用规则兜底补写研究事实
 - 浏览器无法自动启动 → 不影响已生成的页面数据，可手动打开 `dashboard/index.html`
 - 数据异常 → Bloom 标记 `DATA_ISSUE`，不删除候选
@@ -251,6 +282,6 @@ python3 scripts/init_runtime.py
 
 离线执行 `.venv/bin/python scripts/check.py`，覆盖语法、单元测试、策略 JSON、JavaScript 和 Git 空白。该检查不请求行情，不验证当前策略盈利能力。
 
-总状态为 degraded 时先查看具体阶段与原因：解释降级、财务旁路缺失、打开面板失败均不等于核心信号失败。市场 LLM 是当前正式日流程硬门禁，此处不把拟议的健康分层改进写成已生效行为。
+总状态为 degraded 时先查看具体阶段与原因：启用后的解释降级、财务旁路缺失、打开面板失败均不等于核心信号失败。总状态为 done 时仍须阅读资金 partial、Quant 失败与复权状态；市场 LLM 是当前正式日流程硬门禁，此处不把拟议的健康分层改进写成已生效行为。
 
 点时快照、真实账本和运行包的统一备份/恢复演练尚待建立；数据库可读、文件可重建和已有运行锁均不能替代备份。详见改进路线图 R11。

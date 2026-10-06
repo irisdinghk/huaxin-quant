@@ -1,6 +1,10 @@
 {
-  "strategy_version": "model2_quant_v32",
-  "description": "Model 2 VCP structure and setup signal parameters. This file contains thresholds and weights only; algorithms stay in scripts/quant_filter.py.",
+  "strategy_version": "model2_quant_v36",
+  "structure_scoring": {
+    "mode": "impulse_v10",
+    "profile_file": "02-quant-score-v10.json"
+  },
+  "description": "Model 2 VCP structure and setup signals with production V10 scoring and frozen calibration. Algorithms stay in scripts/quant_filter.py and shared scoring modules.",
   "price_adjustment": {
     "mode": "point_in_time_qfq",
     "primary_source": "tdx_xdxr",
@@ -96,6 +100,15 @@
         "min_impulse_peak_volume_ratio": 1.5,
         "right_edge_allowed_volume_patterns": ["drying", "decreasing"]
       }
+    },
+    "impulse_evidence": {
+      "enabled": true,
+      "lookback_days": 30,
+      "diagnostic_lookback_days": [10, 20, 30],
+      "baseline_volume_days": 20,
+      "min_gain_pct": 12.0,
+      "min_up_peak_volume_ratio": 1.5,
+      "upper_shadow_warning_ratio": 0.5
     },
     "strong_impulse_context": {
       "enabled": true,

@@ -1,13 +1,15 @@
 # 模型二：量价精筛模型（自执行指令）
 
 - **版本管理**: 由 Git 分支与提交历史管理，文件名不再携带版本号
-- **最近更新**: 2026-09-15（model2_quant_v32）
+- **最近更新**: 2026-10-06（model2_quant_v36；接入已验收V10结构评分、冻结映射与118买点结构基础换算）
 - **核心目标**: 在模型一基本面候选池中，寻找 VCP 蓄力结构和可交易触发，输出可复现、可回测、可供模型三/四复用的结构化量价结果。
 - **核心哲学**: 基本面先过滤烂公司，模型二只判断资金行为和价格位置。脚本负责确定性计算，LLM 只做可选解释，不参与结构阶段或交易触发判定。
 - **输入**: `pool/pool_<YYMMDD>.csv`，或命令行指定 `--code/--codes`
 - **输出**: 策略数据库中的 Quant 全量快照，以及由该快照发布的 `quant/quant_<YYMMDD>.csv` + `cache/quant_runs/quant_<YYMMDD>.json`
 - **配套脚本**: `scripts/quant_filter.py`
 - **策略配置**: `strategies/02-quant.json`
+
+正式发布以2026-09-30为新评分切换日：当日Quant、Bloom、Signal Plan及页面使用已验收V10结果，后续日常运行沿用同一冻结参数。更早的权威快照保留原评分口径，不因本次发布重算；9月30日旧文档修订及发布前备份保留供审计。
 
 ---
 
@@ -747,6 +749,20 @@ prior_breakout_context_tag = 放量启动后低量重建
 
 放量启动上下文使用当前 VCP 第一轮起点之前的既有量价数据判定：近 10 个交易日从最低收盘到峰值收盘至少上涨 12%，峰值成交量至少为此前 20 日均量的 1.5 倍；峰值位于当前收缩起点附近，当前收盘较启动后最高价回撤不超过 12%，当前成交量较启动峰值至少缩减 45%，当前收缩的收盘回撤不超过 12%，且量能状态为 `drying/decreasing`。所有条件均只用于附加说明，不改变当前结构阶段、结构分和买点权限。
 
+#### 推进证据与正式评分
+
+原收缩组确定后输出`impulse_evidence`。正式V10按60条主窗、放量资格及同峰70%覆盖选择推进，按活动阶段计算Q/R/F并参与结构评分；不改变标准收缩识别、选组、阶段或原强启动上下文标签。无原组不另造结构，无合格推进贡献0；必要数据不完整则阻断该标的评分及买点。
+
+锚点仅使用各阶段首轮起点及以前的数据；耗尽/重建须遵守原右侧确认时间，固定同阶段B/H、不混用旧轮次或未来行情。成交量按整日收盘方向分类，不解释为买卖资金流；一字上涨日保留价格推进，按既定规则剔除量能样本。算法与正式映射见[正式评分参考](02-quant-score-ref.md)，基础字段与阶段时间语义见[推进证据参考](02-quant-impulse-ref.md)。权威JSON/SQLite及CSV保存证据，旧记录不回填。
+
+#### 推进评分隔离研究与旧报告
+
+隔离入口仍为`scripts/audit_impulse_score.py`、研究配置仍为`02-quant-trial.json`；它显式关闭模块内正式评分后重放研究参数，避免V10重复计算/重复归一。正式运行只加载独立的生产参数文件，两者共用纯计算算法，输出用途与版本分别声明。
+
+历史v35与研究版本的规则、全量标定和比较方法见[试算参考](02-quant-score-trial-ref.md)，旧报告保留原版本。源码/参数指纹已变化时不得绕过校验复用旧基线；恢复旧正式策略比较必须使用原冻结源码。研究输出只写新目录，不覆盖权威策略记录，不按后续收益或恢复提示数量调参。
+
+隔离验证使用原日权威Quant组与本地点时前复权行情，输出至单独目录；需核对有序锚点、前后时间边界、平台停留、下跌日峰量、深回吐后恢复和各窗口差异，并比较原字段。不得以新字段改变原日记录。
+
 相邻收缩轮次允许轻微扩张，但明显扩张会打断旧 VCP 组，后一轮应视为新结构的起点：
 
 ```text
@@ -975,7 +991,7 @@ setup_score = setup_structure_base
 结构基础分：
 
 ```text
-setup_structure_base = clamp(round(setup_structure_score × 0.60), 0, 60)
+setup_structure_base = clamp(round(setup_structure_score / 118 × 100 × 0.60), 0, 60)
 ```
 
 `setup_structure_score` 不固定读取触发日的当前结构，而按买点生命周期选择时间锚点：
@@ -1062,74 +1078,19 @@ risk_adjust = clamp(sum(flag_adjustments), -20, +10)
 `setup_signal` 只有在硬条件成立且 `setup_score >= 55` 时触发。
 
 ```text
-structure_score = stage_score
-                + volume_score
-                + trend_score
-                + position_score
+structure_score = clamp(stage_score + volume_score + impulse_score
+                        + trend_score + position_score, 0, 100)
                 + contraction_extension_score
+                + contraction_quality_score
 ```
 
 `structure_score` 只评价结构形态质量，分数越高，说明 VCP 越标准、越紧致、量能越健康、趋势越配合、位置越合理。它不直接决定最终买卖，模型四需结合估值、持仓和风险管理使用。
 
 ### 6.1 structure_score 评分明细
 
-`structure_score` 由五部分相加后限制在 `0~100`：
+正式V10基础预算为阶段40、整理量能20、推进30、趋势5、位置5，合计100；基础截断后另加扩展预算12和优质序列6，统一买点换算预算118，当前实际最高115。四档VCP阶段直接赋15/25/35/40，推进按价量质量与成果保留计算；均线与价格不再主导结构分。
 
-```text
-structure_score = stage_score
-                + volume_score
-                + trend_score
-                + position_score
-                + contraction_extension_score
-```
-
-#### stage_score：结构阶段基础分
-
-| structure_stage | 分数 | 含义 |
-|-----------------|------|------|
-| `VCP_EARLY` | 18 | 识别到早期收缩，但结构样本不足 |
-| `VCP_FORMING` | 32 | 至少两轮收缩，结构开始形成 |
-| `VCP_MATURE` | 45 | 至少三轮收缩，结构较完整 |
-| `VCP_TIGHT` | 55 | 结构成熟且最后一轮较窄，接近 pivot |
-| `TREND_WATCH` | 12 | 趋势强但不是标准 VCP |
-| `POST_BREAKOUT` | 8 | 历史结构已突破延伸，不再作为当前买点 |
-| `TREND_REBUILD` | 8 | 旧结构失效后等待重建 |
-
-#### volume_score：量能评分
-
-| 条件 | 分数 | 含义 |
-|------|------|------|
-| `volume_pattern=decreasing` | +15 | 收缩轮次平均量能递减 |
-| `volume_pattern=drying` | +8 | 当前量能处于缩量状态 |
-| `volume_pattern=failed` | -10 | 最近量能放大，收缩失败 |
-| `volume_dry_up < 0.8` | +10 | 近 5 日均量显著低于近 20 日均量 |
-| `vol_ma20 < vol_ma60` | +5 | 中期量能低于长期量能，抛压减轻 |
-
-#### trend_score：趋势评分
-
-| 条件 | 分数 | 含义 |
-|------|------|------|
-| `MA20 >= MA60` | +7 | 中短期趋势未破坏 |
-| `MA20_slope >= 0` | +4 | MA20 没有向下 |
-| `MA60_slope >= -0.03` | +4 | MA60 没有明显走弱 |
-
-#### position_score：位置评分
-
-| 条件 | 分数 | 含义 |
-|------|------|------|
-| `distance_ma20 ∈ [-4%, +3%]` | +10 | 价格靠近 MA20，回踩位置较合理 |
-| `distance_ma20 <= 10%` | +5 | 价格未明显远离 MA20 |
-| `pivot_distance ∈ [-8%, 0%]` | +12 | 价格接近 pivot 下方，高质量观察区 |
-| `pivot_distance ∈ [-15%, 0%]` | +6 | 距 pivot 尚可，仍可观察 |
-
-#### contraction_extension_score：扩展收缩评分
-
-| 条件 | 分数 | 含义 |
-|------|------|------|
-| `CONFIRMED_RESET_CONTRACTION` | +6 | 重置段已被后一轮量价收敛确认 |
-| `TERMINAL_MICRO_CONTRACTION` | +6 | 标准结构末端出现缩量微收缩并完成修复 |
-
-两项最多各计一次，合计上限 12 分。该项只增强现有结构质量，不改变正式收缩轮数、结构阶段和买点硬条件。
+参数、公式、历史评分锚点、缺失阻断及输出语义见[正式评分参考](02-quant-score-ref.md)。主配置选择`02-quant-score-v10.json`，其中包含修复后9/15的333样本冻结映射；不读取研究目录、不日常重标定。原`02-quant.json.scores`提供量能/趋势/位置的原始条件及风险上限，并保留旧评分兼容分支；其中旧阶段表不作为V10四档阶段分。
 
 ### 6.2 structure_risk_score 风险评分
 
@@ -1441,6 +1402,8 @@ Bloom 详细规则见 `instructions/signal-bloom.md`。
 - 所有核心判断可从 CSV/JSON 中复盘，不依赖对话上下文。
 
 待优化项见 `TODO.md`。历史版本由 Git 追溯，复盘记录见 `dev_logs/`。
+
+V10正式接入的验收范围与衔接记录见[接入方案](../docs/QUANT_V10_INTEGRATION_PLAN.md)。正式评分参数来自`02-quant-score-v10.json`，当前结构与历史锚点统一使用冻结参数；研究与正式记录分开，历史权威输出不回写。
 
 ## 已知待改进边界（2026-09-08）
 
