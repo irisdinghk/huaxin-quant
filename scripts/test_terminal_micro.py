@@ -120,11 +120,11 @@ class TerminalMicroTests(unittest.TestCase):
                                                    (EXTENSIONS[:1], 6, 9), ([], 6, 6)]:
             legacy = {**components, 'contraction_extensions': sum(x['score'] for x in details)}
             result = score_structure(legacy, evidence(), LIVE_CFG, FROZEN, details, quality,
-                                     {'status': 'COMPLETE', 'score': terminal_score})
+                                     {'status': 'COMPLETE', 'score': terminal_score}, structure_stage='VCP_TIGHT')
             self.assertEqual(result['extension'], expected)
             self.assertEqual(result['extension_original'], legacy['contraction_extensions'])
         result = score_structure({**components, 'contraction_extensions': 0}, evidence(),
-                                 LIVE_CFG, FROZEN, [], quality)
+                                 LIVE_CFG, FROZEN, [], quality, structure_stage='VCP_TIGHT')
         self.assertIsNone(result['total'])
         self.assertIn('TERMINAL_MICRO_INCOMPLETE', result['reasons'])
 

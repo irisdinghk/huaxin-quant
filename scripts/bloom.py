@@ -126,6 +126,9 @@ STATE_FIELDS = [
     "breakout_days",
     "structure_breakout_level",
     "score_change",
+    "structure_score_policy_id",
+    "structure_score_policy_changed",
+    "quant_strategy_version",
     "best_status",
     "best_score",
     "best_date",
@@ -554,10 +557,18 @@ def write_events(date_iso, events):
     atomic_write_text(BLOOM_EVENTS_PATH, content)
 
 
+def score_policy_changed(prev_row, row):
+    return bool(prev_row) and (prev_row.get("structure_score_policy_id") or "") != (
+        row.get("structure_score_policy_id") or "")
+
+
 def score_change(prev_row, row):
     if not prev_row:
         return None
-    prev_score = safe_float(prev_row.get("structure_score") or prev_row.get("last_score"), None)
+    if score_policy_changed(prev_row, row):
+        return None
+    previous = prev_row.get("structure_score")
+    prev_score = safe_float(previous if previous not in (None, "") else prev_row.get("last_score"), None)
     if prev_score is None:
         return None
     return safe_float(quant_score(row), 0.0) - prev_score
@@ -745,7 +756,12 @@ def watch_text(status, signal, row, risk):
 
 def state_row(prev_row, row, date_iso, status):
     prev_row = prev_row or {}
-    delta = score_change(prev_row, row)
+    if status == "DATA_ISSUE":
+        row = {**row, "structure_score": prev_row.get("structure_score", 0),
+               "structure_score_policy_id": prev_row.get("structure_score_policy_id", ""),
+               "quant_strategy_version": prev_row.get("quant_strategy_version", "")}
+    delta = None if status == "DATA_ISSUE" else score_change(prev_row, row)
+    policy_changed = score_policy_changed(prev_row, row)
     score = safe_float(quant_score(row), 0.0)
     risk_score = safe_float(quant_risk_score(row), 0.0)
     risk = risk_level(row)
@@ -761,7 +777,7 @@ def state_row(prev_row, row, date_iso, status):
     best_score = safe_float(prev_row.get("best_score"), -1.0)
     best_status = prev_row.get("best_status", "")
     best_date = prev_row.get("best_date", "")
-    if score >= best_score:
+    if policy_changed or score >= best_score:
         best_score = score
         best_status = status
         best_date = date_iso
@@ -823,6 +839,9 @@ def state_row(prev_row, row, date_iso, status):
         "breakout_days": str(row.get("breakout_days") if row.get("breakout_days") is not None else ""),
         "structure_breakout_level": fmt_num(row.get("structure_breakout_level")),
         "score_change": "" if delta is None else fmt_num(delta),
+        "structure_score_policy_id": str(row.get("structure_score_policy_id") or ""),
+        "structure_score_policy_changed": str(policy_changed).lower(),
+        "quant_strategy_version": str(row.get("quant_strategy_version") or row.get("strategy_version") or ""),
         "best_status": best_status,
         "best_score": fmt_num(best_score),
         "best_date": best_date,
@@ -857,6 +876,9 @@ def row_event(row, date_iso):
         "watch_reason": row["watch_reason"],
         "next_watch_point": row["next_watch_point"],
         "strategy_version": STRATEGY_VERSION,
+        "structure_score_policy_id": row.get("structure_score_policy_id", ""),
+        "structure_score_policy_changed": row.get("structure_score_policy_changed", "false"),
+        "quant_strategy_version": row.get("quant_strategy_version", ""),
     }
 
 
@@ -880,6 +902,8 @@ def missing_data_row(prev_row, date_iso):
         "code": prev_row.get("code", ""),
         "name": prev_row.get("name", ""),
         "structure_score": prev_row.get("structure_score", ""),
+        "structure_score_policy_id": prev_row.get("structure_score_policy_id", ""),
+        "quant_strategy_version": prev_row.get("quant_strategy_version", ""),
         "structure_risk_score": prev_row.get("structure_risk_score", ""),
         "structure_risk_flags": prev_row.get("structure_risk_flags", ""),
         "post_breakout_state": prev_row.get("post_breakout_state", ""),

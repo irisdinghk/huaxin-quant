@@ -98,9 +98,11 @@ def main():
             evidence = quant.analyze_impulse_evidence(frame, original, quant.IMPULSE_EVIDENCE_CFG)
             quality = analyze_contraction_quality(frame, original, cfg, evidence)
             before = score_structure(original['score_components'], evidence, previous_cfg, calibration,
-                                     original.get('contraction_extensions'), quality)
+                                     original.get('contraction_extensions'), quality,
+                                     structure_stage=original.get('structure_stage'))
             after = score_structure(original['score_components'], evidence, cfg, calibration,
-                                    original.get('contraction_extensions'), quality, new)
+                                    original.get('contraction_extensions'), quality, new,
+                                    structure_stage=original.get('structure_stage'))
             if digest(original) != original_hash:
                 raise AssertionError('Original structure was mutated')
             pd.testing.assert_frame_equal(frame, frame_before)

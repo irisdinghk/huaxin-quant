@@ -1,4 +1,4 @@
-"""Research-only terminal tightening with current two-day support evidence."""
+"""Shared terminal tightening with current two-day support evidence."""
 
 import numpy as np
 import pandas as pd

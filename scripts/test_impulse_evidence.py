@@ -388,9 +388,10 @@ class ImpulseEvidenceTests(unittest.TestCase):
 
     def test_research_output_does_not_change_any_screen_decision(self):
         df = quant.calc_indicators(frame([100.0] * 125 + [110, 120, 130, 125, 120, 115, 120, 128, 124, 120, 123]))
-        enabled = quant.screen(df)
-        with patch.dict(quant.IMPULSE_EVIDENCE_CFG, {"enabled": False}):
-            disabled = quant.screen(df)
+        with patch.object(quant, "STRUCTURE_SCORING_CFG", None):
+            enabled = quant.screen(df)
+            with patch.dict(quant.IMPULSE_EVIDENCE_CFG, {"enabled": False}):
+                disabled = quant.screen(df)
         self.assertEqual(disabled.pop("impulse_evidence")["status"], "DISABLED")
         enabled.pop("impulse_evidence")
         self.assertEqual(enabled, disabled)

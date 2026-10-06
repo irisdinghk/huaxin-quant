@@ -50,6 +50,7 @@ def trial_module(cfg, calibration):
     module.__file__ = str(ROOT / "scripts/quant_filter.py")
     source = (ROOT / "scripts/quant_filter.py").read_text(encoding="utf-8")
     exec(compile(source, module.__file__, "exec"), module.__dict__)
+    module.STRUCTURE_SCORING_CFG = None
     if selection.get("enabled", False):
         module.analyze_impulse_evidence = partial(analyze_selected_impulse, trial_cfg=cfg)
     original_score, original_finalize = module.score_setup, module.finalize_setup_score
@@ -62,7 +63,8 @@ def trial_module(cfg, calibration):
         terminal = analyze_terminal_micro(df, structure, cfg)
         scored = score_structure(old["components"], evidence, cfg, calibration,
                                  extension_details=structure.get("contraction_extensions"),
-                                 contraction_quality=quality, terminal_micro=terminal)
+                                 contraction_quality=quality, terminal_micro=terminal,
+                                 structure_stage=structure.get("state"))
         day = str(df.iloc[-1]["date"])
         anchor = ((evidence.get("selected") or {}).get("anchor") or {})
         if anchor.get("peak_date") and anchor["peak_date"] > day:
@@ -186,6 +188,7 @@ def report(out, metas, calibration):
     lines = [f"# 推进评分独立试算：基础100＋扩展12＋序列{quality_budget}", "",
              f"仅研究，生产评分未接入。预算：收缩阶段40、推进30、整理量能20、趋势5、位置5；原扩展另加0—12，优质序列另加0或{quality_budget}。",
              f"研究版本：{cfg.get('strategy_version', '未记录')}；Q曲线：{cfg.get('quality_curve', 'linear')}；保留折扣：{cfg.get('retention_curve', 'linear')}。真实retention与retention_coefficient分别记录，系数用于贡献计算。",
+             f"阶段赋分：{cfg.get('stage_scores', '沿用原阶段分比例换算')}。阶段判定保持原算法，每次历史锚点使用对应截止日阶段。",
              f"扩展分研究覆盖：{cfg.get('extension_score_overrides', {})}；尾段新判定启用：{cfg.get('terminal_micro_bonus', {}).get('enabled', False)}，原分与研究分及尾段证据分别输出。",
              f"标定日：{calibration['calibration_date']}，完整去重锚点{len(calibration['samples'])}个。参数冻结后应用后续日；相邻日不是独立样本外验证。", "",
              "| 指标 | 起分值 | 满分值（标定p90） | 样本数 |", "|---|---:|---:|---:|"]
@@ -281,7 +284,8 @@ def main():
                 terminal = analyze_terminal_micro(df, original, cfg)
                 scored = score_structure(original["score_components"], evidence, cfg, calibration,
                                          extension_details=original.get("contraction_extensions"),
-                                         contraction_quality=quality, terminal_micro=terminal)
+                                         contraction_quality=quality, terminal_micro=terminal,
+                                         structure_stage=original.get("structure_stage"))
                 df_before = df.copy(deep=True)
                 baseline = quant.screen(df, code=code)
                 calls.clear()

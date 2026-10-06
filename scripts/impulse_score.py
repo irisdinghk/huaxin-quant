@@ -1,4 +1,4 @@
-"""Pure research scoring; deliberately not imported by the production Quant path."""
+"""Shared deterministic impulse scoring for explicit research or production use."""
 
 import math
 
@@ -18,8 +18,10 @@ def clamp(value, low, high):
 
 
 def validate_config(cfg):
-    if cfg.get("research_only") is not True:
-        raise ValueError("Trial configuration must be research-only")
+    research = cfg.get("research_only")
+    if research is not True and not (
+            research is False and cfg.get("execution_purpose") == "production"):
+        raise ValueError("Scoring use must be explicitly research or production")
     if cfg.get("quality_curve", "linear") not in {"linear", "sqrt"}:
         raise ValueError("Unsupported quality curve")
     if cfg.get("retention_curve", "linear") not in {"linear", "quadratic_drawback"}:
@@ -34,6 +36,15 @@ def validate_config(cfg):
     if (sum(budget[key] for key in ["structure", "volume", "impulse", "trend", "position"]) != 100
             or budget["extension"] != 12 or any(number(v) is None or v <= 0 for v in budget.values())):
         raise ValueError("Budget must be 100 basic points plus 12 extension points")
+    if "stage_scores" in cfg:
+        stages = cfg["stage_scores"]
+        vcp = ["VCP_EARLY", "VCP_FORMING", "VCP_MATURE", "VCP_TIGHT"]
+        if (not isinstance(stages, dict) or set(stages) != set(vcp)
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or number(v) is None or not 0 <= v <= budget["structure"] for v in stages.values())
+                or any(stages[a] >= stages[b] for a, b in zip(vcp, vcp[1:]))
+                or stages["VCP_TIGHT"] != budget["structure"]):
+            raise ValueError("Invalid direct stage scores")
     bonus = cfg.get("contraction_quality_bonus", {})
     if (not isinstance(bonus, dict) or type(bonus.get("enabled", False)) is not bool
             or budget.get("contraction_quality", 0) not in {0, 6}
@@ -197,11 +208,23 @@ def score_impulse(evidence, cfg, calibration):
 
 
 def score_structure(legacy_components, evidence, cfg, calibration, extension_details=None,
-                    contraction_quality=None, terminal_micro=None):
+                    contraction_quality=None, terminal_micro=None, structure_stage=None):
     validate_config(cfg)
     impulse = score_impulse(evidence, cfg, calibration)
     components, reasons = {}, list(impulse["reasons"])
+    stage_policy = "legacy_proportional"
     for key in ["structure", "volume", "trend", "position"]:
+        if key == "structure" and "stage_scores" in cfg:
+            non_vcp = {"TREND_WATCH", "TREND_REBUILD", "POST_BREAKOUT", "POST_BREAKOUT_FAILED",
+                       "POST_BREAKOUT_EXPIRED", "REJECT", "NONE", "DATA_INSUFFICIENT", "DATA_ISSUE"}
+            if not isinstance(structure_stage, str) or structure_stage not in set(cfg["stage_scores"]) | non_vcp:
+                components[key] = None
+                reasons.append("STRUCTURE_STAGE_MISSING_OR_UNKNOWN")
+                continue
+            if structure_stage in cfg["stage_scores"]:
+                components[key] = cfg["stage_scores"][structure_stage]
+                stage_policy = "direct_stage_scores"
+                continue
         value = number(legacy_components.get(key))
         if value is None:
             reasons.append(f"LEGACY_COMPONENT_MISSING:{key}")
@@ -269,8 +292,10 @@ def score_structure(legacy_components, evidence, cfg, calibration, extension_det
     complete = complete and all(v is not None for v in components.values())
     basic_raw = sum(components[k] for k in ["structure", "volume", "trend", "position", "impulse"]) if complete else None
     basic = clamp(basic_raw, 0, 100) if complete else None
-    return {"schema": "impulse_structure_score_v1", "research_only": True,
+    return {"schema": "impulse_structure_score_v1", "research_only": cfg["research_only"],
             "strategy_version": cfg.get("strategy_version"),
+            "structure_stage": structure_stage,
+            "stage_score_policy": stage_policy,
             "status": "COMPLETE" if complete else "INCOMPLETE", "reasons": reasons,
             "components": components, "basic_raw": basic_raw, "basic": basic,
             "extension": components["contraction_extensions"],

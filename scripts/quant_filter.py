@@ -50,6 +50,10 @@ from scripts.data.market_data_service import MarketDataService
 from scripts.data.strategy_data_store import connect as connect_strategy_db, load_document, save_quant
 from scripts.strategy_config import load_strategy_config
 from scripts.impulse_evidence import analyze_impulse_evidence, empty_impulse_evidence
+from scripts.quant_scoring import (
+    IncompleteStructureScore, compute_structure_score, load_profile, presentation_fields,
+)
+from scripts.impulse_score import setup_conversion
 
 
 # ===================== 配置 =====================
@@ -78,6 +82,9 @@ SCORE_CFG = QUANT_STRATEGY["scores"]
 CLASSIFICATION_CFG = QUANT_STRATEGY["classification"]
 SETUP_SCORING_CFG = QUANT_STRATEGY.get("setup_scoring", {})
 PRICE_ADJUSTMENT_CFG = QUANT_STRATEGY["price_adjustment"]
+STRUCTURE_SCORING_CFG, STRUCTURE_CALIBRATION, STRUCTURE_SCORE_POLICY_ID = load_profile(
+    QUANT_STRATEGY, IMPULSE_EVIDENCE_CFG
+)
 
 TEST_CODES = [
     "688256", "301329", "300394", "300308", "002028",
@@ -2256,9 +2263,16 @@ def finalize_setup_score(setup_signal, action_quality_score, action_reasons, act
     structure_quality_cfg = SETUP_SCORING_CFG.get("structure_quality", {})
     setup_structure_score = safe_float(context.get("structure_score"))
     structure_anchor_date = context.get("anchor_date", "")
+    conversion = None
+    if setup_structure_score is not None and STRUCTURE_SCORING_CFG is not None:
+        maximum = 100 + STRUCTURE_SCORING_CFG["budget"]["extension"] + STRUCTURE_SCORING_CFG["budget"].get("contraction_quality", 0)
+        conversion = setup_conversion(setup_structure_score, structure_quality_cfg, maximum)
     if setup_structure_score is None:
         structure_base = stage_cfg.get(structure.get("state"), 0)
         structure_source = "stage_fallback"
+    elif conversion is not None:
+        structure_base = conversion["normalized_base"]
+        structure_source = context.get("source", "signal_time_structure")
     else:
         structure_base = clamp(
             int(round(setup_structure_score * structure_quality_cfg.get("weight", 0.6))),
@@ -2289,7 +2303,8 @@ def finalize_setup_score(setup_signal, action_quality_score, action_reasons, act
         structure_reason = f"结构阶段兼容基础{structure_base}"
     else:
         weight = structure_quality_cfg.get("weight", 0.6)
-        structure_reason = f"结构锚点评分{round_or_none(setup_structure_score)}×{weight:.2f}={structure_base}"
+        divisor = f"/{conversion['structure_maximum']}×100" if conversion else ""
+        structure_reason = f"结构锚点评分{round_or_none(setup_structure_score)}{divisor}×{weight:.2f}={structure_base}"
     reasons = [structure_reason, f"{setup_signal}类型+{type_base}"]
     if setup_signal == "RETEST_BUY" and breakout_action_score is not None:
         weights = SETUP_SCORING_CFG.get("retest_action_weights", {})
@@ -2324,6 +2339,8 @@ def finalize_setup_score(setup_signal, action_quality_score, action_reasons, act
             "structure_source": structure_source,
         },
     }
+    if conversion is not None:
+        score_context["setup_score_components"]["structure_conversion"] = conversion
     return final_score, setup_pattern_score, reasons, misses, score_context
 
 
@@ -2987,7 +3004,7 @@ def detect_retest_buy(df, structure, overheat, code=None):
     )
 
 
-def score_setup(df, structure, pullback, retest, overheat):
+def score_setup_legacy(df, structure, pullback, retest, overheat):
     latest = df.iloc[-1]
 
     stage = structure.get("state")
@@ -3053,6 +3070,17 @@ def score_setup(df, structure, pullback, retest, overheat):
             "contraction_extensions": extension_score,
         }
     }
+
+
+def score_setup(df, structure, pullback, retest, overheat):
+    legacy = score_setup_legacy(df, structure, pullback, retest, overheat)
+    if STRUCTURE_SCORING_CFG is None:
+        return legacy
+    details = compute_structure_score(
+        df, structure, legacy, STRUCTURE_SCORING_CFG, STRUCTURE_CALIBRATION, IMPULSE_EVIDENCE_CFG,
+    )
+    return {**legacy, "structure_score": round(details["total"], 2),
+            "components": details["components"], "details": details}
 
 
 def setup_anchor_snapshot(df, event_idx):
@@ -3405,7 +3433,7 @@ def setup_reference_prices(setup_detail):
     )
 
 
-def screen(df, code=None):
+def _screen(df, code=None):
     """确定性识别 VCP 结构阶段和触发信号，返回结构化结果。"""
     latest = df.iloc[-1]
     if pd.isna(latest.get("MA20")):
@@ -3573,7 +3601,8 @@ def screen(df, code=None):
         "prior_breakout_bonus_reasons": structure.get("prior_breakout_bonus_reasons", []),
         "prior_breakout_context_tag": structure.get("prior_breakout_context_tag", ""),
         "vcp_quality": final_quality,
-        "impulse_evidence": analyze_impulse_evidence(df, structure, IMPULSE_EVIDENCE_CFG),
+        "impulse_evidence": (score.get("details", {}).get("impulse_evidence")
+                             or analyze_impulse_evidence(df, structure, IMPULSE_EVIDENCE_CFG)),
         "contractions": structure.get("contractions", []),
         "contraction_group": structure.get("contraction_group", []),
         "destructive_reset": structure.get("destructive_reset"),
@@ -3590,7 +3619,29 @@ def screen(df, code=None):
             "breakout": breakout.get("plan_inputs", {}),
             "retest": retest.get("plan_inputs", {}),
         },
+        **({"structure_score_details": score["details"],
+            **presentation_fields(structure, score["details"])} if "details" in score else {}),
     }
+
+
+def screen(df, code=None):
+    try:
+        result = _screen(df, code=code)
+    except IncompleteStructureScore as exc:
+        # Reuse the existing DATA_ISSUE contract without a legacy-score fallback.
+        invalid = df.copy()
+        invalid.loc[invalid.index[-1], "MA20"] = np.nan
+        result = _screen(invalid, code=code)
+        result.update(reason=f"V10评分数据不完整：{exc}", structure_misses=exc.details["reasons"],
+                      setup_misses=exc.details["reasons"], structure_score_details=exc.details)
+    if STRUCTURE_SCORING_CFG is not None:
+        result.update(
+            structure_score_policy_id=STRUCTURE_SCORE_POLICY_ID,
+            structure_score_calibration_date=STRUCTURE_CALIBRATION["calibration_date"],
+            structure_score_maximum=118,
+            structure_scoring_status="INCOMPLETE" if result["structure_stage"] == "DATA_ISSUE" else "COMPLETE",
+        )
+    return result
 
 
 # ===================== 输出 =====================
@@ -3616,6 +3667,8 @@ CSV_COLUMNS = [
     "chg_5", "chg_20", "price_mode", "adjustment_status", "factor_version",
     "applied_action_count", "latest_corporate_action_date",
     "reason", "run_date", "strategy_version", "impulse_evidence",
+    "structure_score_policy_id", "structure_score_calibration_date", "structure_score_maximum",
+    "structure_scoring_status", "structure_score_details", "contraction_quality_score", "contraction_quality_tags",
 ]
 
 
@@ -3756,6 +3809,13 @@ def write_csv(results, quant_path):
                 r["run_date"],
                 r["strategy_version"],
                 json.dumps(r.get("impulse_evidence", {}), ensure_ascii=False, separators=(",", ":")),
+                r.get("structure_score_policy_id", ""),
+                r.get("structure_score_calibration_date", ""),
+                r.get("structure_score_maximum", ""),
+                r.get("structure_scoring_status", ""),
+                json.dumps(r.get("structure_score_details", {}), ensure_ascii=False, separators=(",", ":")),
+                r.get("contraction_quality_score", 0),
+                ";".join(r.get("contraction_quality_tags", [])),
             ])
     print(f"\n精选池已输出: {quant_path}")
 
@@ -4082,6 +4142,9 @@ def main():
             "schema": "quant_vcp_structure_v2",
             "strategy_version": STRATEGY_VERSION,
             "strategy_file": f"strategies/{QUANT_STRATEGY_FILE}",
+            "structure_score_policy_id": STRUCTURE_SCORE_POLICY_ID,
+            "structure_score_calibration_date": (STRUCTURE_CALIBRATION or {}).get("calibration_date"),
+            "structure_score_profile_file": QUANT_STRATEGY.get("structure_scoring", {}).get("profile_file"),
             "price_mode": PRICE_ADJUSTMENT_CFG["mode"],
             "adjustment_factor_version": PRICE_ADJUSTMENT_CFG["factor_version"],
             "corporate_action_source": PRICE_ADJUSTMENT_CFG["primary_source"],

@@ -51,9 +51,84 @@ class ImpulseSelectionTests(unittest.TestCase):
         self.assertEqual(recent["rejection_reasons"], ["NO_RELATIVE_VOLUME_EXPANSION"])
         self.assertFalse(recent["eligible"])
 
-    def test_same_peak_prefers_nearest_valid_low_not_largest_gain(self):
+    def test_same_peak_prefers_largest_qualified_gain(self):
+        df, st = fixture(same_peak=True)
+        cfg = copy.deepcopy(CFG)
+        cfg["impulse_selection"]["same_peak_base"] = "max_gain"
+        result = analyze(df, st, cfg)
+        self.assertEqual(result["selected"]["anchor"]["base_idx"], 24)
+        self.assertEqual(result["selected"]["anchor"]["peak_idx"], 37)
+        self.assertEqual(result["selected"]["selection_rule"], "qualified_max_gain_close_low_v1")
+
+    def test_latest_qualified_peak_precedes_larger_older_advance(self):
+        df, st = fixture()
+        result = analyze(df, st)
+        self.assertEqual(result["selected"]["anchor"]["base_idx"], 34)
+        self.assertEqual(result["selected"]["anchor"]["peak_idx"], 37)
+        earlier = next(x for x in result["selected"]["candidate_summaries"] if x["base_date"] == df.iloc[24]["date"])
+        self.assertTrue(earlier["eligible"])
+        self.assertGreater(earlier["gain_pct"], result["selected"]["price"]["gain_pct"])
+
+    def test_coverage_uses_price_span_instead_of_percentage_gain_ratio(self):
         df, st = fixture(same_peak=True)
         result = analyze(df, st)
+        selected = result["selected"]
+        self.assertEqual(selected["anchor"]["base_idx"], 34)
+        self.assertEqual(selected["selection_rule"], "qualified_coverage_nearest_close_low_v1")
+        summaries = {x["base_date"]: x for x in selected["candidate_summaries"]}
+        earlier, recent = summaries[df.iloc[24]["date"]], summaries[df.iloc[34]["date"]]
+        self.assertLess(recent["gain_pct"] / earlier["gain_pct"], .7)
+        self.assertAlmostEqual(recent["advance_coverage"], 25 / 35, places=6)
+        self.assertEqual(recent["max_qualified_advance_span"], 35)
+        self.assertTrue(recent["eligible"])
+
+    def test_coverage_threshold_accepts_exact_boundary_and_rejects_below(self):
+        for base, expected in [(100.5, 34), (100.5001, 24)]:
+            with self.subTest(base=base):
+                df, st = fixture(same_peak=True)
+                df.loc[34, ["close", "open", "high", "low"]] = [base, base, base + 1, base - 1]
+                selected = analyze(df, st)["selected"]
+                self.assertEqual(selected["anchor"]["base_idx"], expected)
+                recent = next(x for x in selected["candidate_summaries"] if x["base_date"] == df.iloc[34]["date"])
+                self.assertTrue(recent["price_volume_eligible"])
+                self.assertEqual(recent["eligible"], expected == 34)
+                self.assertEqual(recent["rejection_reasons"], [] if expected == 34 else ["ADVANCE_COVERAGE_BELOW_THRESHOLD"])
+
+    def test_coverage_threshold_is_configurable_without_reselecting_global_low(self):
+        df, st = fixture(same_peak=True)
+        cfg = copy.deepcopy(CFG)
+        cfg["impulse_selection"]["min_advance_coverage"] = .8
+        selected = analyze(df, st, cfg)["selected"]
+        self.assertEqual(selected["anchor"]["base_idx"], 24)
+        self.assertEqual(selected["price_volume_eligible_candidate_count"], 2)
+        self.assertEqual(selected["eligible_candidate_count"], 1)
+
+    def test_unqualified_larger_advance_does_not_set_coverage_denominator(self):
+        df, st = fixture(same_peak=True)
+        df.loc[25:33, "volume"] = 10
+        selected = analyze(df, st)["selected"]
+        self.assertEqual(selected["anchor"]["base_idx"], 34)
+        earlier = next(x for x in selected["candidate_summaries"] if x["base_date"] == df.iloc[24]["date"])
+        recent = next(x for x in selected["candidate_summaries"] if x["base_date"] == df.iloc[34]["date"])
+        self.assertFalse(earlier["price_volume_eligible"])
+        self.assertEqual(earlier["rejection_reasons"], ["NO_RELATIVE_VOLUME_EXPANSION"])
+        self.assertEqual(recent["advance_coverage"], 1)
+
+    def test_coverage_is_relative_to_same_peak_only(self):
+        df, st = fixture()
+        selected = analyze(df, st)["selected"]
+        self.assertEqual(selected["anchor"]["peak_idx"], 37)
+        refs = {x["peak_date"]: x for x in selected["coverage_reference_by_peak"]}
+        self.assertEqual(refs[df.iloc[29]["date"]]["max_advance_span"], 45)
+        self.assertEqual(refs[df.iloc[37]["date"]]["max_advance_span"], 25)
+        recent = next(x for x in selected["candidate_summaries"] if x["base_date"] == df.iloc[34]["date"])
+        self.assertEqual(recent["advance_coverage"], 1)
+
+    def test_previous_nearest_configuration_remains_reproducible(self):
+        df, st = fixture(same_peak=True)
+        cfg = copy.deepcopy(CFG)
+        cfg["impulse_selection"]["same_peak_base"] = "nearest"
+        result = analyze(df, st, cfg)
         self.assertEqual(result["selected"]["anchor"]["base_idx"], 34)
         self.assertEqual(result["selected"]["anchor"]["peak_idx"], 37)
         earlier = next(x for x in result["selected"]["candidate_summaries"] if x["base_date"] == df.iloc[24]["date"])
@@ -85,6 +160,8 @@ class ImpulseSelectionTests(unittest.TestCase):
         self.assertEqual(result["status"], "DATA_ISSUE")
         self.assertIsNone(result["selected"]["anchor"])
         self.assertEqual(impulse_metrics(result, CFG)["status"], "INCOMPLETE")
+        self.assertEqual(result["selected"]["coverage_status"], "INCOMPLETE")
+        self.assertTrue(all(x["advance_coverage"] is None for x in result["selected"]["candidate_summaries"]))
 
     def test_missing_ohlc_cannot_bypass_one_price_checks(self):
         df, st = fixture()
@@ -104,6 +181,7 @@ class ImpulseSelectionTests(unittest.TestCase):
 
     def test_two_day_base_is_provisional_without_extra_minimum_duration(self):
         df, st = fixture(same_peak=True)
+        df.loc[25:33, "volume"] = 10
         st["contraction_group"][0].update(start_idx=36, start_date=str(df.iloc[36]["date"]))
         result = analyze(df, st)
         self.assertEqual(result["selected"]["anchor"]["base_idx"], 34)
@@ -112,6 +190,7 @@ class ImpulseSelectionTests(unittest.TestCase):
 
     def test_later_bars_do_not_confirm_or_reselect_a_stage_start_base(self):
         df, st = fixture(same_peak=True)
+        df.loc[25:33, "volume"] = 10
         st["contraction_group"][0].update(start_idx=36, start_date=str(df.iloc[36]["date"]))
         before = analyze(df.iloc[:37], {**st, "contraction_group": [{**st["contraction_group"][0],
                             "end_idx": 36, "end_date": str(df.iloc[36]["date"]), "confirmation_status": "PROVISIONAL"}]})
@@ -167,11 +246,23 @@ class ImpulseSelectionTests(unittest.TestCase):
 
     def test_invalid_selection_rules_are_rejected(self):
         for key, value in [("lookback_days", True), ("base_swing_window", 0),
-                           ("min_up_mean_volume_ratio", .8), ("same_peak_base", "max_gain")]:
+                           ("min_up_mean_volume_ratio", .8), ("same_peak_base", "unknown")]:
             rule = copy.deepcopy(CFG["impulse_selection"])
             rule[key] = value
             with self.assertRaises(ValueError):
                 validate_selection_config(rule)
+
+    def test_invalid_or_missing_coverage_threshold_is_rejected(self):
+        for value in [None, True, 0, -.1, 1.01, float("nan"), float("inf"), "0.7"]:
+            with self.subTest(value=value):
+                rule = copy.deepcopy(CFG["impulse_selection"])
+                rule["min_advance_coverage"] = value
+                with self.assertRaises(ValueError):
+                    validate_selection_config(rule)
+        rule = copy.deepcopy(CFG["impulse_selection"])
+        del rule["min_advance_coverage"]
+        with self.assertRaises(ValueError):
+            validate_selection_config(rule)
 
 
 if __name__ == "__main__":

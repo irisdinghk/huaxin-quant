@@ -19,7 +19,7 @@ from scripts.data.corporate_actions import (
     verification_status,
 )
 from scripts.data.tdx_block_data import TDXBlockSource
-from scripts.data.market_data import MiaoxiangSource
+from scripts.data.market_data import MiaoxiangSource, normalize_tdx_decoded_zeros
 from scripts.shared import expected_trade_date, normalize_date_arg
 
 
@@ -72,10 +72,10 @@ class MarketDataService:
         return [row[0] for row in conn.execute("SELECT code FROM universe_members WHERE trade_date=? AND eligible=1", (as_of,))]
 
     @staticmethod
-    def normalized_bars(frame: pd.DataFrame, code: str, as_of: str) -> list[tuple]:
+    def normalized_bars(frame: pd.DataFrame, code: str, as_of: str, *, source: str = "tdx") -> list[tuple]:
         if frame is None or frame.empty:
             return []
-        data = frame.copy()
+        data = normalize_tdx_decoded_zeros(frame) if source == "tdx" else frame.copy()
         date_column = "datetime" if "datetime" in data else "date"
         volume_column = "vol" if "vol" in data else "volume"
         amount_column = "amount" if "amount" in data else None
@@ -85,7 +85,7 @@ class MarketDataService:
         now = datetime.now().isoformat(timespec="seconds")
         return [
             (code, str(row.trade_date), float(row.open), float(row.high), float(row.low), float(row.close),
-             float(getattr(row, volume_column)), float(getattr(row, amount_column)) if amount_column and pd.notna(getattr(row, amount_column)) else None, "tdx", now)
+             float(getattr(row, volume_column)), float(getattr(row, amount_column)) if amount_column and pd.notna(getattr(row, amount_column)) else None, source, now)
             for row in data.itertuples(index=False)
         ]
 
@@ -99,10 +99,10 @@ class MarketDataService:
         except Exception as exc:
             primary_error = str(exc)
         frame, error = fallback.fetch_bars(code, name)
-        bars = self.normalized_bars(frame, code, as_of) if frame is not None else []
+        bars = self.normalized_bars(frame, code, as_of, source="miaoxiang") if frame is not None else []
         if not bars or bars[-1][1] != as_of:
             raise RuntimeError(f"TDX: {primary_error}; 妙想: {error or '未覆盖目标交易日'}")
-        return [(*bar[:8], "miaoxiang", bar[9]) for bar in bars]
+        return bars
 
     @staticmethod
     def save_bars(conn: sqlite3.Connection, bars: list[tuple]) -> None:
@@ -229,6 +229,15 @@ class MarketDataService:
             for code in repair.get("repaired_codes", []):
                 if code in status:
                     status[code]["source"] = str(frames[code].iloc[-1]["source"])
+            for code in list(frames):
+                last_date = str(frames[code].iloc[-1]["date"])
+                if last_date != as_of:
+                    frames.pop(code)
+                    status[code].update({
+                        "source": "target_date_missing",
+                        "error": status[code].get("error") or f"目标日{as_of}无有效成交行情，最近有效日为{last_date}",
+                        "last_trade_date": last_date,
+                    })
             if price_mode == "point_in_time_qfq":
                 cfg = adjustment_config or {}
                 source = TDXBlockSource()

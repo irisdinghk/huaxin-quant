@@ -1,4 +1,4 @@
-"""Research-only fixed bonus for improving contractions in one active phase."""
+"""Shared fixed bonus for improving contractions in one active phase."""
 
 import numpy as np
 import pandas as pd

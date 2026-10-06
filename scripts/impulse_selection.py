@@ -1,4 +1,4 @@
-"""Research-only price-volume qualification and nearby closing-low impulse bases."""
+"""Shared price-volume qualification and nearby closing-low impulse bases."""
 
 import copy
 import math
@@ -16,7 +16,7 @@ def validate_selection_config(rule):
         return
     if (type(rule.get("lookback_days")) is not int or rule["lookback_days"] <= 0
             or type(rule.get("base_swing_window")) is not int or rule["base_swing_window"] <= 0
-            or rule.get("same_peak_base") != "nearest"
+            or rule.get("same_peak_base") not in ("nearest", "max_gain", "coverage_nearest")
             or not isinstance(rule.get("diagnostic_lookback_days"), list)
             or any(type(value) is not int or value <= 0 for value in rule["diagnostic_lookback_days"])):
         raise ValueError("Invalid impulse search or base selection rule")
@@ -24,6 +24,11 @@ def validate_selection_config(rule):
     if (isinstance(ratio, bool) or not isinstance(ratio, (int, float))
             or not math.isfinite(ratio) or ratio < 1):
         raise ValueError("Impulse qualification must require relative volume expansion")
+    if rule["same_peak_base"] == "coverage_nearest":
+        coverage = rule.get("min_advance_coverage")
+        if (isinstance(coverage, bool) or not isinstance(coverage, (int, float))
+                or not math.isfinite(coverage) or not 0 < coverage <= 1):
+            raise ValueError("Impulse coverage must be finite and in (0, 1]")
 
 
 def _base_lows(df, scan_start, start, window):
@@ -52,7 +57,10 @@ def select_candidates(df, candidates, scan_start, start, cfg, rule):
     prefix = df.iloc[:start + 1]
     lows = _base_lows(prefix, scan_start, start, rule["base_swing_window"])
     eligible, summaries, incomplete = [], [], False
-    rank = lambda item: (item["peak_idx"], item["base_idx"])
+    if rule["same_peak_base"] == "max_gain":
+        rank = lambda item: (item["peak_idx"], item["gain_pct"], item["base_idx"])
+    else:
+        rank = lambda item: (item["peak_idx"], item["base_idx"])
     for item in sorted(candidates, key=rank, reverse=True):
         b, h = item["base_idx"], item["peak_idx"]
         low = lows.get(b)
@@ -86,6 +94,46 @@ def select_candidates(df, candidates, scan_start, start, cfg, rule):
             "base_confirmation": low, "volume": volume, "eligible": not reasons,
             "rejection_reasons": reasons,
         })
+    coverage_diagnostics = {}
+    if rule["same_peak_base"] == "coverage_nearest":
+        threshold = rule["min_advance_coverage"]
+        summary_by_base = {item["base_date"]: item for item in summaries}
+        for summary in summaries:
+            summary.update(price_volume_eligible=summary["eligible"], advance_coverage=None,
+                           advance_price_span=None, max_qualified_advance_span=None)
+        coverage_diagnostics = {"min_advance_coverage": threshold,
+                                "coverage_status": "INCOMPLETE" if incomplete else "COMPLETE",
+                                "price_volume_eligible_candidate_count": len(eligible),
+                                "coverage_reference_by_peak": []}
+        if not incomplete:
+            references = {}
+            for item in eligible:
+                b, h = item["base_idx"], item["peak_idx"]
+                span = float(prefix.iloc[h]["close"] - prefix.iloc[b]["close"])
+                if h not in references or span > references[h]["span"]:
+                    references[h] = {"span": span, "item": item, "count": 0}
+            for item in eligible:
+                b, h = item["base_idx"], item["peak_idx"]
+                span = float(prefix.iloc[h]["close"] - prefix.iloc[b]["close"])
+                reference = references[h]
+                reference["count"] += 1
+                summary = summary_by_base[str(prefix.iloc[b]["date"])]
+                passes = span >= threshold * reference["span"]
+                summary.update(advance_price_span=_number(span),
+                               max_qualified_advance_span=_number(reference["span"]),
+                               advance_coverage=_number(span / reference["span"]), eligible=passes)
+                if not passes:
+                    summary["rejection_reasons"].append("ADVANCE_COVERAGE_BELOW_THRESHOLD")
+            eligible = [item for item in eligible
+                        if summary_by_base[str(prefix.iloc[item["base_idx"]]["date"])]["eligible"]]
+            for h, reference in sorted(references.items(), reverse=True):
+                b = reference["item"]["base_idx"]
+                coverage_diagnostics["coverage_reference_by_peak"].append({
+                    "peak_date": str(prefix.iloc[h]["date"]), "peak_close": _number(prefix.iloc[h]["close"]),
+                    "reference_base_date": str(prefix.iloc[b]["date"]),
+                    "reference_base_close": _number(prefix.iloc[b]["close"]),
+                    "max_advance_span": _number(reference["span"]), "qualified_count": reference["count"],
+                })
     # Unknown eligibility must not silently become a rejection or a weaker anchor.
     selected = None if incomplete else (max(eligible, key=rank) if eligible else None)
     return {
@@ -94,8 +142,10 @@ def select_candidates(df, candidates, scan_start, start, cfg, rule):
         "reasons": (["QUALIFICATION_VOLUME_INCOMPLETE"] if incomplete else
                     ([] if selected else ["NO_QUALIFIED_PRICE_VOLUME_ADVANCE"])),
         "diagnostics": {"candidate_summaries": summaries, "eligible_candidate_count": len(eligible),
-                        "base_candidate_count": len(lows), "selection_rule": "qualified_nearest_close_low_v1",
-                        "selected_base_confirmation": lows.get(selected["base_idx"]) if selected else None},
+                        "base_candidate_count": len(lows),
+                        "selection_rule": f"qualified_{rule['same_peak_base']}_close_low_v1",
+                        "selected_base_confirmation": lows.get(selected["base_idx"]) if selected else None,
+                        **coverage_diagnostics},
     }
 
 

@@ -18,6 +18,7 @@ from scripts.test_contraction_quality import fixture as quality_fixture
 
 LIVE_CFG = json.loads((ROOT / "strategies/02-quant-trial.json").read_text(encoding="utf-8"))
 CFG = copy.deepcopy(LIVE_CFG)
+CFG.pop("stage_scores")
 CFG.pop("contraction_quality_bonus")
 CFG.pop("terminal_micro_bonus")
 CFG["budget"].pop("contraction_quality")
@@ -205,17 +206,18 @@ class ImpulseScoreTests(unittest.TestCase):
         components = {'structure': 55, 'volume': 30, 'trend': 15, 'position': 22, 'contraction_extensions': 12}
         base = score_structure(components, evidence(), LIVE_CFG, FROZEN, EXTENSIONS,
                                {'status': 'COMPLETE', 'score': 0, 'hit': False},
-                               {'status': 'COMPLETE', 'score': 6, 'hit': True})
+                               {'status': 'COMPLETE', 'score': 6, 'hit': True}, structure_stage='VCP_TIGHT')
         improved = score_structure(components, evidence(), LIVE_CFG, FROZEN, EXTENSIONS,
                                    {'status': 'COMPLETE', 'score': 6, 'hit': True},
-                                   {'status': 'COMPLETE', 'score': 6, 'hit': True})
+                                   {'status': 'COMPLETE', 'score': 6, 'hit': True}, structure_stage='VCP_TIGHT')
         self.assertEqual(base['basic'], improved['basic'])
         self.assertEqual(base['extension'], improved['extension'])
         self.assertEqual(base['extension'], 9)
         self.assertEqual(improved['total'] - base['total'], 6)
         self.assertEqual(improved['score_maximum'], 118)
         for quality in [None, {'status': 'INCOMPLETE', 'score': None}, {'status': 'COMPLETE', 'score': 3}]:
-            result = score_structure(components, evidence(), LIVE_CFG, FROZEN, EXTENSIONS, quality)
+            result = score_structure(components, evidence(), LIVE_CFG, FROZEN, EXTENSIONS, quality,
+                                     structure_stage='VCP_TIGHT')
             self.assertEqual(result['status'], 'INCOMPLETE')
             self.assertIsNone(result['total'])
 
@@ -229,6 +231,101 @@ class ImpulseScoreTests(unittest.TestCase):
                                              {'risk_score': 0, 'risk_flags': []})
         self.assertEqual(result[-1]['setup_structure_base'], 54)
         self.assertEqual(result[-1]['setup_score_components']['trial_conversion']['structure_maximum'], 118)
+
+    def test_direct_vcp_stages_do_not_depend_on_legacy_stage_points(self):
+        cfg = {**CFG, 'stage_scores': LIVE_CFG['stage_scores']}
+        for stage, expected in [('VCP_EARLY', 15), ('VCP_FORMING', 25),
+                                ('VCP_MATURE', 35), ('VCP_TIGHT', 40)]:
+            for legacy_stage in [None, 0, 55]:
+                components = {'volume': 0, 'trend': 0, 'position': 0, 'contraction_extensions': 0}
+                if legacy_stage is not None:
+                    components['structure'] = legacy_stage
+                result = score_structure(components, {'status': 'NO_GROUP'}, cfg, FROZEN,
+                                         structure_stage=stage)
+                self.assertEqual(result['status'], 'COMPLETE')
+                self.assertEqual(result['total'], expected)
+                self.assertEqual(result['stage_score_policy'], 'direct_stage_scores')
+
+    def test_missing_or_unknown_stage_does_not_guess_from_original_points(self):
+        cfg = {**CFG, 'stage_scores': LIVE_CFG['stage_scores']}
+        components = {'structure': 32, 'volume': 0, 'trend': 0, 'position': 0, 'contraction_extensions': 0}
+        for stage in [None, 'VCP_UNKNOWN', ['VCP_FORMING']]:
+            result = score_structure(components, {'status': 'NO_GROUP'}, cfg, FROZEN,
+                                     structure_stage=stage)
+            self.assertEqual(result['status'], 'INCOMPLETE')
+            self.assertIsNone(result['total'])
+            self.assertIn('STRUCTURE_STAGE_MISSING_OR_UNKNOWN', result['reasons'])
+
+    def test_stage_table_requires_complete_finite_increasing_budgeted_values(self):
+        for key, value in [('VCP_EARLY', None), ('VCP_EARLY', True), ('VCP_EARLY', '15'),
+                           ('VCP_EARLY', float('nan')), ('VCP_FORMING', -1),
+                           ('VCP_FORMING', 35), ('VCP_MATURE', 41), ('VCP_TIGHT', 39)]:
+            cfg = copy.deepcopy(LIVE_CFG)
+            cfg['stage_scores'][key] = value
+            with self.assertRaises(ValueError):
+                validate_config(cfg)
+        for missing in [True, False]:
+            cfg = copy.deepcopy(LIVE_CFG)
+            if missing:
+                cfg['stage_scores'].pop('VCP_EARLY')
+            else:
+                cfg['stage_scores']['VCP_OTHER'] = 0
+            with self.assertRaises(ValueError):
+                validate_config(cfg)
+
+    def test_stage_change_preserves_every_other_score_and_legacy_path(self):
+        cfg = {**CFG, 'stage_scores': LIVE_CFG['stage_scores']}
+        components = {'structure': 32, 'volume': 20, 'trend': 8, 'position': 0, 'contraction_extensions': 0}
+        old = score_structure(components, evidence(), CFG, FROZEN)
+        new = score_structure(components, evidence(), cfg, FROZEN, structure_stage='VCP_FORMING')
+        self.assertEqual(old['components']['structure'], 32 * 40 / 55)
+        self.assertAlmostEqual(new['total'] - old['total'], 25 - 32 * 40 / 55)
+        for key in ['volume', 'trend', 'position', 'impulse', 'contraction_extensions', 'contraction_quality']:
+            self.assertEqual(old['components'][key], new['components'][key])
+        self.assertEqual(old['impulse'], new['impulse'])
+        self.assertEqual(old['score_maximum'], new['score_maximum'])
+
+    def test_non_vcp_scores_preserve_collapsed_archive_states(self):
+        cfg = {**CFG, 'stage_scores': LIVE_CFG['stage_scores']}
+        for stage, raw in [('TREND_WATCH', 12), ('TREND_REBUILD', 8), ('POST_BREAKOUT', 8),
+                           ('POST_BREAKOUT', 0), ('POST_BREAKOUT_FAILED', 0),
+                           ('POST_BREAKOUT_EXPIRED', 0), ('REJECT', 0), ('NONE', 0)]:
+            components = {'structure': raw, 'volume': 0, 'trend': 0, 'position': 0, 'contraction_extensions': 0}
+            old = score_structure(components, {'status': 'NO_GROUP'}, CFG, FROZEN)
+            new = score_structure(components, {'status': 'NO_GROUP'}, cfg, FROZEN, structure_stage=stage)
+            self.assertEqual(old['total'], new['total'])
+            self.assertEqual(new['stage_score_policy'], 'legacy_proportional')
+
+    def test_historical_prefix_uses_its_own_final_stage_and_keeps_production_isolated(self):
+        functions = (quant.score_setup, quant.finalize_setup_score, quant.detect_vcp_structure)
+        shadow, calls = trial_module(LIVE_CFG, FROZEN)
+        df = pd.DataFrame({'date': ['2026-09-10', '2026-09-11'], 'MA20': [100, 100], 'MA60': [90, 90],
+                           'distance_ma20': [0, 0], 'volume_dry_up': [.5, .5],
+                           'vol_ma20': [100, 100], 'vol_ma60': [200, 200]})
+        structure = {'state': 'VCP_EARLY', 'volume_pattern': 'decreasing', 'pivot_distance': -2,
+                     'contraction_extension_score': 0, 'contraction_extensions': []}
+        snapshot = copy.deepcopy(structure)
+        with patch.object(shadow, 'analyze_impulse_evidence', return_value=evidence()), \
+                patch('scripts.audit_impulse_score.analyze_contraction_quality', return_value={'status': 'COMPLETE', 'score': 0}), \
+                patch('scripts.audit_impulse_score.analyze_terminal_micro', return_value={'status': 'COMPLETE', 'score': 0}):
+            shadow.score_setup(df.iloc[:1], structure, {}, {}, {'risk_score': 0})
+            shadow.score_setup(df, {**structure, 'state': 'VCP_MATURE'}, {}, {}, {'risk_score': 0})
+        self.assertEqual([x['as_of'] for x in calls], ['2026-09-10', '2026-09-11'])
+        self.assertEqual([x['score']['components']['structure'] for x in calls], [15, 35])
+        self.assertEqual([x['score']['structure_stage'] for x in calls], ['VCP_EARLY', 'VCP_MATURE'])
+        self.assertEqual(structure, snapshot)
+        self.assertEqual(functions, (quant.score_setup, quant.finalize_setup_score, quant.detect_vcp_structure))
+
+    def test_forming_pullback_theoretical_ceiling_reaches_a_boundary_without_threshold_change(self):
+        raw = LIVE_CFG['stage_scores']['VCP_FORMING'] + 60 + 6 + 6
+        shadow, _ = trial_module(LIVE_CFG, FROZEN)
+        structure = {'state': 'VCP_FORMING', 'setup_score_context': {'PULLBACK_BUY': {'structure_score': raw}}}
+        result = shadow.finalize_setup_score('PULLBACK_BUY', 15, [], [], structure,
+                                             {'risk_score': 0, 'risk_flags': []})
+        self.assertEqual(raw, 97)
+        self.assertEqual(result[-1]['setup_structure_base'], 49)
+        self.assertEqual(result[0], 80)
+        self.assertEqual(shadow.SETUP_SCORING_CFG, quant.SETUP_SCORING_CFG)
 
     def test_bonus_is_recomputed_on_each_historical_prefix(self):
         shadow, calls = trial_module(LIVE_CFG, FROZEN)
