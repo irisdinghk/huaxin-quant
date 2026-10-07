@@ -32,7 +32,7 @@ LEGACY_MANAGED_PATH = CACHE_DIR / "managed_watchlist.csv"
 
 BUY_SIGNALS = {"PULLBACK_BUY", "BREAKOUT_BUY", "RETEST_BUY"}
 EXCLUDED_BLOOM_STATUSES = {"RISK_BLOCKED", "DATA_ISSUE", "INVALID", "EXIT"}
-FORMING_MIN_SCORE = 70.0
+FORMING_MIN_SCORE = 60.0
 EARLY_MIN_SCORE = 75.0
 POST_BREAKOUT_MIN_SCORE = 60.0
 POST_BREAKOUT_TRACKING_STATES = {
@@ -139,6 +139,7 @@ def target_row(row, date_iso):
     return {
         "code": code,
         "name": str(row.get("name") or "").strip(),
+        "date": date_iso,
         "selection": selection,
         "model2_stage": stage,
         "structure_score": row.get("structure_score", ""),

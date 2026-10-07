@@ -1,5 +1,5 @@
 {
-  "strategy_version": "model4_bloom_signal_v6",
+  "strategy_version": "model4_bloom_signal_v7",
   "description": "Bloom signal layer parameters. Bloom consumes Model 2 quant JSON, tracks signal lifecycle, and does not run valuation or position management.",
   "inputs": {
     "quant_run_dir": "cache/quant_runs",
@@ -90,6 +90,7 @@
     "allow_medium_risk_for_medium_priority": true
   },
   "reporting": {
+    "llm_enabled": false,
     "top_candidates": 20,
     "section_limit": 30,
     "human_review_limit": 12,

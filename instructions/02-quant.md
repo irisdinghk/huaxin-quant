@@ -1,13 +1,15 @@
 # 模型二：量价精筛模型（自执行指令）
 
 - **版本管理**: 由 Git 分支与提交历史管理，文件名不再携带版本号
-- **最近更新**: 2026-09-01（model2_quant_v30）
+- **最近更新**: 2026-10-06（model2_quant_v36；接入已验收V10结构评分、冻结映射与118买点结构基础换算）
 - **核心目标**: 在模型一基本面候选池中，寻找 VCP 蓄力结构和可交易触发，输出可复现、可回测、可供模型三/四复用的结构化量价结果。
 - **核心哲学**: 基本面先过滤烂公司，模型二只判断资金行为和价格位置。脚本负责确定性计算，LLM 只做可选解释，不参与结构阶段或交易触发判定。
 - **输入**: `pool/pool_<YYMMDD>.csv`，或命令行指定 `--code/--codes`
 - **输出**: 策略数据库中的 Quant 全量快照，以及由该快照发布的 `quant/quant_<YYMMDD>.csv` + `cache/quant_runs/quant_<YYMMDD>.json`
 - **配套脚本**: `scripts/quant_filter.py`
 - **策略配置**: `strategies/02-quant.json`
+
+正式发布以2026-09-30为新评分切换日：当日Quant、Bloom、Signal Plan及页面使用已验收V10结果，后续日常运行沿用同一冻结参数。更早的权威快照保留原评分口径，不因本次发布重算；9月30日旧文档修订及发布前备份保留供审计。
 
 ---
 
@@ -50,7 +52,7 @@ python3 scripts/quant_filter.py --code 300604 --json
 | 模型三 | 估值锚点，判断贵便宜 |
 | 模型四 | 结合估值和持仓执行交易动作 |
 
-LLM 失败不能影响主流程。默认不调用 LLM。
+当前暂停 Quant 的 LLM 文字解读，不发送解释请求；`--with-llm` / `--llm-top` 仅保留命令行兼容性，传入也跳过。输出 `llm.status=skipped`、`reason=disabled`。结构识别、评分和触发判定继续由脚本执行。本文其他可选 LLM 说明作为恢复后的接口约定。
 
 ### 策略配置边界
 
@@ -197,6 +199,8 @@ VCP_MATURE / VCP_TIGHT 结构已经成立
 
 ### 交易触发仓位路径
 
+以下是模型二量价侧的示意提示，不是自动加减仓程序：模块不读取账户或真实持仓，不能推断已买入。Dashboard 另按 Signal Plan 指令中的同日环境折算 A/B 条件提示；账户分母与组合风险预算仍待完善。
+
 ```text
 PULLBACK_BUY 买入 20%-30%
 → 若直接突破且触发 BREAKOUT_BUY：加至 40%-50%
@@ -228,7 +232,7 @@ SQLite 日线库 → 缺口检测与补数 → 通达信 TDX/mootdx → 妙想 A
 
 免费源对送转与极小额现金分红的复权因子可能存在交易所舍入差异：归一化因子相对误差不超过 `1%`、原始收盘价误差不超过 `0.15%` 视为通过；超过任一阈值才记为 `CONFLICT`。阈值调整时允许根据已保存的误差重新分类，不重复请求核验源。
 
-免费核验适配器依赖 `baostock`（项目虚拟环境执行 `.venv/bin/pip install baostock`）。依赖缺失或服务暂时不可用时记录 `PENDING`，不得回写或伪造核验成功。
+免费核验适配器依赖 `baostock`（项目虚拟环境执行 `.venv/bin/pip install baostock`）。登录连接须设置 10 秒网络超时；登录失败后本轮不再重复连接。依赖缺失、超时或服务暂时不可用时记录 `PENDING`，不得回写或伪造核验成功。
 
 复权状态口径：
 
@@ -249,8 +253,8 @@ CONFLICT   复权因子或原始价格超出容差；该标的本轮不得进入
 数据库只保存原始日线和独立公司行为记录，不保存复权日线或指标列；复权价格与指标每次实时计算，避免锚点或规则变化后旧结果污染。数据库命中必须同时满足：
 
 ```text
-文件名日期 = 当前运行日期；或运行日缓存未命中时，为该股票不晚于运行日的最近可用缓存
-缓存内最后一条 K 线日期 >= 目标交易日
+按股票代码与 as_of_date 查询 SQLite，返回窗口不含 as_of_date 之后的行情
+目标日覆盖与历史窗口长度满足数据服务要求；不足时进入补数/失败处理
 ```
 
 若数据库中目标标的未覆盖运行日，脚本必须补数；若回源返回了目标交易日之后的数据，数据层必须先截断到 `<= as_of_date` 再写入，防止复盘指定日期时混入未来 K 线。
@@ -543,6 +547,21 @@ support_price / invalid_price / breakout_level
 
 ### VCP 结构过程监控
 
+历史收缩段趋势资格（v32）：原始收缩识别完成后、结构选组之前，按每段
+起点（收盘摆动高点）的收盘价与**该日起点 MA120**比较。低于 MA120 的段
+作为趋势中断依据。以最后一个不合格段的结束日为分界，它及之前的所有段
+不参与结构选组、枢纽、计数、扩展加分或突破判断，只保留起点在分界之后的段。
+不得跳过不合格段拼接两侧结构，也不得因右侧段被排除而回选更老的结构。
+后来的站回均线不能重新激活分界之前的段；尚无分界后收缩时允许没有标准 VCP。
+等于均线时保留，不要求段内低点或每个交易日都在均线上，不追加斜率门槛。
+已确认段与右端暂定段使用同一规则。MA120 尚未形成时沿用现有缺失兼容口径，
+保留但注明未验证，不将其描述为已通过历史趋势验证。
+原始 `contractions` 保留审计字段 `historical_trend_eligible`、
+`historical_trend_reason`（AT_OR_ABOVE_MA120 / BELOW_MA120 / MA120_UNAVAILABLE /
+BEFORE_TREND_RESET）、`historical_trend_boundary_date`（最后不合格段结束日，无则 null）、
+`historical_trend_anchor_date`、`historical_trend_anchor_close`、`historical_trend_ma120`；
+`contraction_group` 等有效结构字段只消费过滤后的段。当前交易日的下述基础及背景判断不变。
+
 基础条件：
 
 ```text
@@ -729,6 +748,20 @@ prior_breakout_context_tag = 放量启动后低量重建
 若旧组不具备有效 VCP 突破资格，但当前有效 VCP 之前出现明确的放量启动，随后保持小幅回撤、显著缩量并形成当前收缩，则复用既有附加信息字段输出 `prior_breakout_context_tag=放量启动后强势整理`。该标签只提高机会辨识度：`prior_breakout_bonus_score` 必须为空，不得恢复旧结构分，不得进入旧 Pivot 的 `RETEST_BUY` 或强势突破后单轮 VCP 专用 `PULLBACK_BUY`。
 
 放量启动上下文使用当前 VCP 第一轮起点之前的既有量价数据判定：近 10 个交易日从最低收盘到峰值收盘至少上涨 12%，峰值成交量至少为此前 20 日均量的 1.5 倍；峰值位于当前收缩起点附近，当前收盘较启动后最高价回撤不超过 12%，当前成交量较启动峰值至少缩减 45%，当前收缩的收盘回撤不超过 12%，且量能状态为 `drying/decreasing`。所有条件均只用于附加说明，不改变当前结构阶段、结构分和买点权限。
+
+#### 推进证据与正式评分
+
+原收缩组确定后输出`impulse_evidence`。正式V10按60条主窗、放量资格及同峰70%覆盖选择推进，按活动阶段计算Q/R/F并参与结构评分；不改变标准收缩识别、选组、阶段或原强启动上下文标签。无原组不另造结构，无合格推进贡献0；必要数据不完整则阻断该标的评分及买点。
+
+锚点仅使用各阶段首轮起点及以前的数据；耗尽/重建须遵守原右侧确认时间，固定同阶段B/H、不混用旧轮次或未来行情。成交量按整日收盘方向分类，不解释为买卖资金流；一字上涨日保留价格推进，按既定规则剔除量能样本。算法与正式映射见[正式评分参考](02-quant-score-ref.md)，基础字段与阶段时间语义见[推进证据参考](02-quant-impulse-ref.md)。权威JSON/SQLite及CSV保存证据，旧记录不回填。
+
+#### 推进评分隔离研究与旧报告
+
+隔离入口仍为`scripts/audit_impulse_score.py`、研究配置仍为`02-quant-trial.json`；它显式关闭模块内正式评分后重放研究参数，避免V10重复计算/重复归一。正式运行只加载独立的生产参数文件，两者共用纯计算算法，输出用途与版本分别声明。
+
+历史v35与研究版本的规则、全量标定和比较方法见[试算参考](02-quant-score-trial-ref.md)，旧报告保留原版本。源码/参数指纹已变化时不得绕过校验复用旧基线；恢复旧正式策略比较必须使用原冻结源码。研究输出只写新目录，不覆盖权威策略记录，不按后续收益或恢复提示数量调参。
+
+隔离验证使用原日权威Quant组与本地点时前复权行情，输出至单独目录；需核对有序锚点、前后时间边界、平台停留、下跌日峰量、深回吐后恢复和各窗口差异，并比较原字段。不得以新字段改变原日记录。
 
 相邻收缩轮次允许轻微扩张，但明显扩张会打断旧 VCP 组，后一轮应视为新结构的起点：
 
@@ -958,7 +991,7 @@ setup_score = setup_structure_base
 结构基础分：
 
 ```text
-setup_structure_base = clamp(round(setup_structure_score × 0.60), 0, 60)
+setup_structure_base = clamp(round(setup_structure_score / 118 × 100 × 0.60), 0, 60)
 ```
 
 `setup_structure_score` 不固定读取触发日的当前结构，而按买点生命周期选择时间锚点：
@@ -1045,74 +1078,19 @@ risk_adjust = clamp(sum(flag_adjustments), -20, +10)
 `setup_signal` 只有在硬条件成立且 `setup_score >= 55` 时触发。
 
 ```text
-structure_score = stage_score
-                + volume_score
-                + trend_score
-                + position_score
+structure_score = clamp(stage_score + volume_score + impulse_score
+                        + trend_score + position_score, 0, 100)
                 + contraction_extension_score
+                + contraction_quality_score
 ```
 
 `structure_score` 只评价结构形态质量，分数越高，说明 VCP 越标准、越紧致、量能越健康、趋势越配合、位置越合理。它不直接决定最终买卖，模型四需结合估值、持仓和风险管理使用。
 
 ### 6.1 structure_score 评分明细
 
-`structure_score` 由五部分相加后限制在 `0~100`：
+正式V10基础预算为阶段40、整理量能20、推进30、趋势5、位置5，合计100；基础截断后另加扩展预算12和优质序列6，统一买点换算预算118，当前实际最高115。四档VCP阶段直接赋15/25/35/40，推进按价量质量与成果保留计算；均线与价格不再主导结构分。
 
-```text
-structure_score = stage_score
-                + volume_score
-                + trend_score
-                + position_score
-                + contraction_extension_score
-```
-
-#### stage_score：结构阶段基础分
-
-| structure_stage | 分数 | 含义 |
-|-----------------|------|------|
-| `VCP_EARLY` | 18 | 识别到早期收缩，但结构样本不足 |
-| `VCP_FORMING` | 32 | 至少两轮收缩，结构开始形成 |
-| `VCP_MATURE` | 45 | 至少三轮收缩，结构较完整 |
-| `VCP_TIGHT` | 55 | 结构成熟且最后一轮较窄，接近 pivot |
-| `TREND_WATCH` | 12 | 趋势强但不是标准 VCP |
-| `POST_BREAKOUT` | 8 | 历史结构已突破延伸，不再作为当前买点 |
-| `TREND_REBUILD` | 8 | 旧结构失效后等待重建 |
-
-#### volume_score：量能评分
-
-| 条件 | 分数 | 含义 |
-|------|------|------|
-| `volume_pattern=decreasing` | +15 | 收缩轮次平均量能递减 |
-| `volume_pattern=drying` | +8 | 当前量能处于缩量状态 |
-| `volume_pattern=failed` | -10 | 最近量能放大，收缩失败 |
-| `volume_dry_up < 0.8` | +10 | 近 5 日均量显著低于近 20 日均量 |
-| `vol_ma20 < vol_ma60` | +5 | 中期量能低于长期量能，抛压减轻 |
-
-#### trend_score：趋势评分
-
-| 条件 | 分数 | 含义 |
-|------|------|------|
-| `MA20 >= MA60` | +7 | 中短期趋势未破坏 |
-| `MA20_slope >= 0` | +4 | MA20 没有向下 |
-| `MA60_slope >= -0.03` | +4 | MA60 没有明显走弱 |
-
-#### position_score：位置评分
-
-| 条件 | 分数 | 含义 |
-|------|------|------|
-| `distance_ma20 ∈ [-4%, +3%]` | +10 | 价格靠近 MA20，回踩位置较合理 |
-| `distance_ma20 <= 10%` | +5 | 价格未明显远离 MA20 |
-| `pivot_distance ∈ [-8%, 0%]` | +12 | 价格接近 pivot 下方，高质量观察区 |
-| `pivot_distance ∈ [-15%, 0%]` | +6 | 距 pivot 尚可，仍可观察 |
-
-#### contraction_extension_score：扩展收缩评分
-
-| 条件 | 分数 | 含义 |
-|------|------|------|
-| `CONFIRMED_RESET_CONTRACTION` | +6 | 重置段已被后一轮量价收敛确认 |
-| `TERMINAL_MICRO_CONTRACTION` | +6 | 标准结构末端出现缩量微收缩并完成修复 |
-
-两项最多各计一次，合计上限 12 分。该项只增强现有结构质量，不改变正式收缩轮数、结构阶段和买点硬条件。
+参数、公式、历史评分锚点、缺失阻断及输出语义见[正式评分参考](02-quant-score-ref.md)。主配置选择`02-quant-score-v10.json`，其中包含修复后9/15的333样本冻结映射；不读取研究目录、不日常重标定。原`02-quant.json.scores`提供量能/趋势/位置的原始条件及风险上限，并保留旧评分兼容分支；其中旧阶段表不作为V10四档阶段分。
 
 ### 6.2 structure_risk_score 风险评分
 
@@ -1303,11 +1281,11 @@ setup_plan_inputs.retest:
 
 ```text
 DEEPSEEK_API_KEY=...
-DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_MODEL=deepseek-flash
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 ```
 
-本地 `.env` 不进入 Git。默认模型使用 `deepseek-v4-flash`。
+本地 `.env` 不进入 Git。默认模型使用 `deepseek-flash`，对应 DeepSeek-V4.1-Flash；旧名称 `deepseek-v4-flash` 只作为官方临时兼容别名，不作为项目默认值。
 
 DeepSeek 调用使用 OpenAI 兼容的 Chat Completions 接口，并启用 JSON Output：
 
@@ -1424,3 +1402,11 @@ Bloom 详细规则见 `instructions/signal-bloom.md`。
 - 所有核心判断可从 CSV/JSON 中复盘，不依赖对话上下文。
 
 待优化项见 `TODO.md`。历史版本由 Git 追溯，复盘记录见 `dev_logs/`。
+
+V10正式接入的验收范围与衔接记录见[接入方案](../docs/QUANT_V10_INTEGRATION_PLAN.md)。正式评分参数来自`02-quant-score-v10.json`，当前结构与历史锚点统一使用冻结参数；研究与正式记录分开，历史权威输出不回写。
+
+## 已知待改进边界（2026-09-08）
+
+volume_pattern_for_contractions 当前先判断近期 drying，再判断段均量 failed，因此可能出现段均量扩大而输出 drying 的情况。分离段均量和近期量能是 [路线图 R2](../docs/IMPROVEMENT_ROADMAP.md) 的待实现任务；本次只记录现状，不改变分数、阶段或买点权限。
+
+setup_signal/实际 A–D 与回测 Plan 兑现/A–REGULAR 是不同契约，详见 [backtest.md](backtest.md)。不能用当前 Plan 回测替代全部模型二信号的效果评价。

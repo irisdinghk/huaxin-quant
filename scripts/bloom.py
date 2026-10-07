@@ -39,15 +39,20 @@ from scripts.data.strategy_data_store import (
     document_dates as strategy_document_dates,
     load_all_bloom_events,
     load_bloom_state,
+    load_pool_tracking_rows,
     load_document as load_strategy_document,
     save_bloom,
+    save_pool_tracking_rows,
 )
+from scripts.data.pool_tracking import finalize_tracking_rows
 
 
 BLOOM_STRATEGY_FILE = "04-bloom.json"
 
 CONFIG, STRATEGY_PATH = load_strategy_config(BLOOM_STRATEGY_FILE)
 STRATEGY_VERSION = CONFIG["strategy_version"]
+POOL_CONFIG, _ = load_strategy_config("01-pool.json")
+POOL_TRACKING_CONFIG = POOL_CONFIG.get("expansion_pool", {}).get("tracking", {})
 
 QUANT_RUNS_DIR = Path(PROJECT_ROOT) / CONFIG["inputs"]["quant_run_dir"]
 BLOOM_STATE_PATH = Path(PROJECT_ROOT) / CONFIG["inputs"]["state_path"]
@@ -121,6 +126,9 @@ STATE_FIELDS = [
     "breakout_days",
     "structure_breakout_level",
     "score_change",
+    "structure_score_policy_id",
+    "structure_score_policy_changed",
+    "quant_strategy_version",
     "best_status",
     "best_score",
     "best_date",
@@ -549,10 +557,18 @@ def write_events(date_iso, events):
     atomic_write_text(BLOOM_EVENTS_PATH, content)
 
 
+def score_policy_changed(prev_row, row):
+    return bool(prev_row) and (prev_row.get("structure_score_policy_id") or "") != (
+        row.get("structure_score_policy_id") or "")
+
+
 def score_change(prev_row, row):
     if not prev_row:
         return None
-    prev_score = safe_float(prev_row.get("structure_score") or prev_row.get("last_score"), None)
+    if score_policy_changed(prev_row, row):
+        return None
+    previous = prev_row.get("structure_score")
+    prev_score = safe_float(previous if previous not in (None, "") else prev_row.get("last_score"), None)
     if prev_score is None:
         return None
     return safe_float(quant_score(row), 0.0) - prev_score
@@ -740,7 +756,12 @@ def watch_text(status, signal, row, risk):
 
 def state_row(prev_row, row, date_iso, status):
     prev_row = prev_row or {}
-    delta = score_change(prev_row, row)
+    if status == "DATA_ISSUE":
+        row = {**row, "structure_score": prev_row.get("structure_score", 0),
+               "structure_score_policy_id": prev_row.get("structure_score_policy_id", ""),
+               "quant_strategy_version": prev_row.get("quant_strategy_version", "")}
+    delta = None if status == "DATA_ISSUE" else score_change(prev_row, row)
+    policy_changed = score_policy_changed(prev_row, row)
     score = safe_float(quant_score(row), 0.0)
     risk_score = safe_float(quant_risk_score(row), 0.0)
     risk = risk_level(row)
@@ -756,7 +777,7 @@ def state_row(prev_row, row, date_iso, status):
     best_score = safe_float(prev_row.get("best_score"), -1.0)
     best_status = prev_row.get("best_status", "")
     best_date = prev_row.get("best_date", "")
-    if score >= best_score:
+    if policy_changed or score >= best_score:
         best_score = score
         best_status = status
         best_date = date_iso
@@ -818,6 +839,9 @@ def state_row(prev_row, row, date_iso, status):
         "breakout_days": str(row.get("breakout_days") if row.get("breakout_days") is not None else ""),
         "structure_breakout_level": fmt_num(row.get("structure_breakout_level")),
         "score_change": "" if delta is None else fmt_num(delta),
+        "structure_score_policy_id": str(row.get("structure_score_policy_id") or ""),
+        "structure_score_policy_changed": str(policy_changed).lower(),
+        "quant_strategy_version": str(row.get("quant_strategy_version") or row.get("strategy_version") or ""),
         "best_status": best_status,
         "best_score": fmt_num(best_score),
         "best_date": best_date,
@@ -852,6 +876,9 @@ def row_event(row, date_iso):
         "watch_reason": row["watch_reason"],
         "next_watch_point": row["next_watch_point"],
         "strategy_version": STRATEGY_VERSION,
+        "structure_score_policy_id": row.get("structure_score_policy_id", ""),
+        "structure_score_policy_changed": row.get("structure_score_policy_changed", "false"),
+        "quant_strategy_version": row.get("quant_strategy_version", ""),
     }
 
 
@@ -875,6 +902,8 @@ def missing_data_row(prev_row, date_iso):
         "code": prev_row.get("code", ""),
         "name": prev_row.get("name", ""),
         "structure_score": prev_row.get("structure_score", ""),
+        "structure_score_policy_id": prev_row.get("structure_score_policy_id", ""),
+        "quant_strategy_version": prev_row.get("quant_strategy_version", ""),
         "structure_risk_score": prev_row.get("structure_risk_score", ""),
         "structure_risk_flags": prev_row.get("structure_risk_flags", ""),
         "post_breakout_state": prev_row.get("post_breakout_state", ""),
@@ -1090,7 +1119,7 @@ def call_llm_insights(watching_rows, quant_results=None, progress_file=None):
             "returned": 0,
         }
 
-    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
     base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
     status = {
         "status": "pending",
@@ -1305,10 +1334,12 @@ def build_bloom(payload, previous_payload, date_yy, allow_partial=False, progres
     # ── LLM 解读：只为达到独立分数门槛的重点观察标的生成自然语言洞察 ──
     watching = sections.get("watching", [])
     llm_min_score = safe_float(CONFIG.get("reporting", {}).get("llm_min_structure_score"), 70.0)
-    llm_watching = [r for r in watching if should_call_llm_insight(r)]
+    llm_enabled = CONFIG.get("reporting", {}).get("llm_enabled", False)
+    llm_watching = [r for r in watching if should_call_llm_insight(r)] if llm_enabled else []
     llm_status = {
         "status": "skipped",
-        "reason": f"no watching rows at or above structure score {fmt_num(llm_min_score)}",
+        "reason": (f"no watching rows at or above structure score {fmt_num(llm_min_score)}"
+                   if llm_enabled else "disabled"),
         "requested": 0,
         "returned": 0,
         "minimum_structure_score": llm_min_score,
@@ -1725,6 +1756,22 @@ def main():
         bloom = load_strategy_document(strategy_conn, "bloom", bloom["summary"]["date"])
         if not args.no_state_update:
             new_state = load_bloom_state(strategy_conn, bloom["summary"]["date"])
+            tracking_rows = load_pool_tracking_rows(strategy_conn, trade_date)
+            if tracking_rows and POOL_TRACKING_CONFIG.get("enabled", False):
+                quant_by_code = {
+                    normalize_code(row.get("code")): row
+                    for row in payload.get("results", [])
+                    if normalize_code(row.get("code"))
+                }
+                finalized_tracking = finalize_tracking_rows(
+                    trade_date,
+                    tracking_rows.values(),
+                    quant_by_code,
+                    new_state,
+                    int(POOL_TRACKING_CONFIG["rebuild_observation_trade_days"]),
+                    bool(POOL_TRACKING_CONFIG.get("retain_data_issue", True)),
+                )
+                save_pool_tracking_rows(strategy_conn, trade_date, finalized_tracking)
             all_events = load_all_bloom_events(strategy_conn)
 
     if not args.no_state_update:

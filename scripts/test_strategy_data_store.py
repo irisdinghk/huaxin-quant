@@ -6,9 +6,12 @@ from scripts.data.strategy_data_store import (
     connect,
     lifecycle_latest,
     load_document,
+    load_latest_pool_tracking_before,
+    load_pool_tracking_rows,
     load_vcp_selection_events,
     replace_lifecycle_rows,
     save_bloom,
+    save_pool_tracking_rows,
     save_buy_point_events,
     save_quant,
     save_signal_plan,
@@ -37,6 +40,41 @@ class StrategyDataStoreTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(load_document(self.conn, "quant", "2026-08-12"), payload)
         self.assertEqual(self.conn.execute("SELECT count(*) FROM vcp_structure_snapshots").fetchone()[0], 1)
+
+    def test_pool_tracking_replace_and_strict_prior_load(self):
+        def row(date, status):
+            return {
+                "trade_date": date, "code": "000001", "name": "测试",
+                "tracking_status": status, "resolution_status": "FINAL",
+                "first_seen_date": "2026-08-10", "last_rs_eligible_date": "2026-08-10",
+                "rs_current_eligible": status == "RS_ACTIVE", "grace_trade_days": 0,
+                "grace_remaining_days": 20, "strategy_version": "p1",
+            }
+
+        save_pool_tracking_rows(self.conn, "2026-08-10", [row("2026-08-10", "RS_ACTIVE")])
+        save_pool_tracking_rows(self.conn, "2026-08-10", [row("2026-08-10", "STRUCTURE_TRACKED")])
+        self.assertEqual(len(load_pool_tracking_rows(self.conn, "2026-08-10")), 1)
+        self.assertEqual(load_latest_pool_tracking_before(self.conn, "2026-08-10"), {})
+        prior = load_latest_pool_tracking_before(self.conn, "2026-08-11")
+        self.assertEqual(prior["000001"]["tracking_status"], "STRUCTURE_TRACKED")
+
+    def test_pool_liquidity_audit_survives_pending_and_final_storage(self):
+        row = {
+            "trade_date": "2026-09-14", "code": "301108", "name": "洁雅股份",
+            "tracking_status": "STRUCTURE_TRACKED", "resolution_status": "PENDING",
+            "first_seen_date": "2026-08-31", "rs_current_eligible": False,
+            "liquidity_filter_exempt": True, "liquidity_structure_active": True,
+            "quant_stage": "VCP_FORMING", "bloom_status": "COOLDOWN",
+            "post_breakout_state": "POST_BREAKOUT_HOT",
+        }
+        save_pool_tracking_rows(self.conn, row["trade_date"], [row])
+        self.assertTrue(load_pool_tracking_rows(self.conn, row["trade_date"])["301108"]["liquidity_filter_exempt"])
+        self.assertEqual(load_latest_pool_tracking_before(self.conn, "2026-09-15"), {})
+        row["resolution_status"] = "FINAL"
+        save_pool_tracking_rows(self.conn, row["trade_date"], [row])
+        prior = load_latest_pool_tracking_before(self.conn, "2026-09-15")["301108"]
+        self.assertTrue(prior["liquidity_filter_exempt"])
+        self.assertTrue(prior["liquidity_structure_active"])
 
     def test_plan_and_buy_events_are_stable(self):
         plan = {"code": "000001", "structure_anchor": "2026-07-01",

@@ -1,230 +1,84 @@
 # AGENTS.md
 
-## 项目概要
+## 项目与入口职责
 
-Huaxin Quant，多模型流水线的股票花期发现与跟踪系统。Codex 在本项目中负责阅读指令卡、维护配套脚本、执行数据流水线、验证输出结果，并在需要时提交代码。
+Huaxin Quant 是多模型流水线的股票花期发现与跟踪系统。本文件统一规定各 Agent 的工程操作、投研协作和数据使用约束；执行或修改模块前，先读对应指令卡。
 
-项目采用双目录架构：
-
-- `<runtime-workspace>`：本地工作区，作为 Huaxin Quant 的运行实例，负责日常运行、缓存、输出、报告。
-- `<source-repo>`：云盘 Git 仓库，负责 Huaxin Quant 源代码、指令卡和开发文档版本管理。
-
-`instructions/`、`scripts/`、`strategies/`、`CLAUDE.md`、`AGENTS.md`、`TODO.md` 在本地工作区中可以是指向源码仓库的软链。缓存、输出目录、持仓账本和本地开发日志默认不进 Git。
+项目采用双目录架构：`<runtime-workspace>` 是本地运行实例，保存缓存、输出、报告和持仓；`<source-repo>` 是云盘 Git 源码仓库。`instructions/`、`scripts/`、`strategies/` 和入口文档在运行实例中可以是源码仓库的软链。先确认实际路径，不把云盘上的运行数据误当作受版本管理的源文件。
 
 ## 核心规则
 
-### 1. Git 操作必须走云盘路径
+### 1. Git 操作必须走源码仓库路径
 
-本地工作区没有 `.git`。所有 Git 命令必须显式使用云盘仓库路径：
-
-```bash
-git -C <source-repo> status
-git -C <source-repo> diff
-git -C <source-repo> add <file>
-git -C <source-repo> commit -m "..."
-```
-
-禁止在 `<runtime-workspace>` 直接执行普通 `git status`、`git diff`、`git add`、`git commit`。
+所有 Git 命令显式使用 `git -C <source-repo> ...`。禁止在没有 `.git` 的本地运行实例直接执行普通 `git status/diff/add/commit`。
 
 ### 2. 脚本始终走本地 symlink 路径调用
 
-运行项目脚本时必须使用本地工作区路径，例如：
-
-```bash
-python3 scripts/run_pool.py
-python3 scripts/quant_filter.py
-python3 scripts/bloom.py
-python3 scripts/position.py
-```
-
-`quant_lab/scripts/` 是指向云盘源码仓库的 symlink。通过本地 symlink 调用时，脚本内的 `PROJECT_ROOT` 自然指向本地工作区，可以正确读取 `cache/`、`pool/`、`quant/`、`bloom/`、`reports/`、`position/` 等运行数据。不要用云盘真实路径直接调用脚本。
+从本地运行实例调用 `scripts/...`，例如 `.venv/bin/python scripts/daily.py`，使 `PROJECT_ROOT` 指向运行实例。不要用云盘真实路径调用脚本，否则会读写错误的数据目录。
 
 ### 3. 源文件走 Git，数据产物不提交
 
-纳入 Git 的内容：
-
-- `CLAUDE.md`
-- `AGENTS.md`
-- `TODO.md`
-- `instructions/*.md`
-- `scripts/*.py`
-- `strategies/*.json`
-- 必要的项目配置和开发文档
-
-默认不纳入 Git 的内容：
-
-- `cache/`
-- `pool/`
-- `quant/`
-- `bloom/`
-- `reports/`
-- `daily_research/`
-- `position/`
-- `dev_logs/`
-- `.env`
-- `.tmp/`
-- `tmp_*/`
-
-运行模型产生的 CSV、JSON、PKL、报告文件只作为本地结果使用，除非用户明确要求提交。
+入口文档、指令卡、脚本、策略配置和必要开发文档纳入 Git；缓存、模型输出、报告、持仓、人工研究、开发日志、临时文件和 `.env` 默认不提交，除非用户明确要求。dashboard 页面源码纳入 Git，生成的 `dashboard/data/` 不提交；是否为软链不改变这一界限。
 
 ### 4. 改规则先改指令卡，再改脚本
 
-每个模型由 `instructions/` 下的指令卡定义规则，`scripts/` 下的脚本负责稳定执行。
+实际规则修改按以下顺序执行：更新指令卡（规则、阈值、口径、输出）→ 更新配置及脚本 → 语法检查与必要验证 → 摘要说明；代码与指令卡同一次提交。不得只修改其中一侧。
 
-修改筛选逻辑时顺序如下：
-
-1. 更新对应指令卡，说明规则、阈值、字段口径和输出结构。
-2. 更新配套脚本。
-3. 运行语法检查和必要的脚本验证。
-4. 对结果做摘要说明。
-5. 代码和指令卡同一次提交。
-
-不要只改脚本不改指令卡，也不要只改指令卡不更新脚本。
-
-指令卡保持精简：只保留 LLM 执行所需内容（流程、规则、约束）。公式速查、报告模板、字段定义等放入配对 `*-ref.md`，按需查阅。
+指令卡只保留执行所需流程、规则和约束；公式、模板、字段定义放入配对 `*-ref.md`。文档与代码不符时先区分描述过期和规则变更；仅校正文档不更改策略版本。TODO 和路线图中的待实现方案不得当作现行规则。
 
 ### 5. 临时脚本放 `.tmp/`
 
-需要临时分析或一次性脚本时，统一写到：
-
-```text
-.tmp/scripts/
-```
-
-优先使用项目已有脚本和标准命令。临时脚本用完后清理 `.tmp/scripts/`，保留 `.tmp/` 目录本身。
-
-Codex 执行时优先用 `rg`、`sed`、`python3 -m py_compile`、项目脚本等稳定命令。不要用 ad-hoc 命令污染项目根目录。
+临时分析与一次性脚本放 `.tmp/scripts/`，不污染项目根目录。优先使用已有脚本和 `rg`、`sed` 等稳定命令；完成后只清理本任务创建且不再需要的临时文件（含 skill 遗留的 `tmp_*/`），保留 `.tmp/` 目录，不删除其他任务的文件。
 
 ### 6. Python 使用项目虚拟环境
 
-项目要求 Python 3.11+。本地运行实例使用根目录 `.venv/`，执行脚本和检查时优先显式调用：
+Python 3.11+，优先显式调用 `.venv/bin/python scripts/...`，语法检查使用 `.venv/bin/python -m py_compile ...`。也可先激活 `.venv/` 再使用文档中的 `python3`；不得使用 macOS 自带的 `/usr/bin/python3`（Python 3.9 / LibreSSL）。
 
-```bash
-.venv/bin/python scripts/check.py
-.venv/bin/python scripts/daily.py
-```
+### 7. 投研伙伴：专业、独立、连续
 
-也可以先执行 `source .venv/bin/activate`，再使用文档中的 `python3 scripts/...` 命令。不要使用 macOS 自带的 `/usr/bin/python3`（Python 3.9 / LibreSSL）。
+- 准确理解用户实际表达的观点，不擅自扩大成绝对主张再反驳。独立判断以证据为依据，不迎合用户，也不为表现谨慎而机械唱反调；不得随用户态度改变结论或候选排序。
+- 主动核验关键数据的来源、日期、单位及复权口径，区分事实、资金行为解释和预测。数据不足时明确缺口并继续可完成的研究，不虚构精确度，不用后续涨跌倒推当时必买或必卖。
+- 对具体机会给出明确判断及理由：结构与承接、上方供给及收益空间、参与条件、失效依据和下一步验证。支持与反对都落实到证据；风险说明应服务于决策，不用泛泛免责声明或反复劝退代替分析。
+- 判断有连续性，操作有适应性：以一致的供需和价量逻辑识别机会，市场环境用于调整风险预算、加仓节奏、回调容忍和持续性预期，不仅凭环境标签否决机会。先按结构确定失效依据，再用仓位调节风险，不机械收紧止损。
+- 主动检验最关键的反向证据与替代解释，说明什么会推翻当前判断。观点变化须指出新增证据及原判断哪里需修正；复盘区分识别、规则、执行和环境影响，不用单笔输赢证明或否定整个体系。
+- 承担分析质量、事实准确性、持续跟踪和纠错责任。将研究转化为可验证的计划与经验，持续改进体系；人工研究结论与系统现行规则分开表述，修改自动策略仍遵循第4节流程。
 
-### 7. 每日投研笔记统一放入 `daily_research/`
+### 8. 研究笔记与持仓连续维护
 
-用户要求记录、整理或归档当日个股研究时，统一写入：
+- 每日研究前读取最近的 `daily_research/` 笔记及 `position/current_holdings_discussion.csv`，核对持仓、原计划、风险锚点和待验证问题，只围绕新增证据更新判断。
+- 盘后从系统候选筛出逐只研究顺序时，按 `instructions/opportunity-screening.md` 执行；该人工流程不属于系统执行链。
+- 先分析讨论，再合并到 `daily_research/YYYY-MM-DD.md`，每日一份。提炼背景、关键证据、分歧与修正、交易及计划验证、触发/失效条件和下一交易日检查项；区分事实、用户观点、Codex判断与共同结论，不逐字转录或重复系统日报。
+- 数据与判断对应研究日期，后续验证追加记录，不覆盖当时推理。人工笔记默认不入Git；`reports/daily/`用于系统日报，`dev_logs/`用于工程复盘。
+- 持仓基线为最近确认的券商截图或导出表，加其后用户确认的交易；截图仅证明对应日期状态。同一时点的事实优先级为券商持仓、成交记录、用户确认交易、正式账本及派生状态、历史讨论，不以旧快照覆盖后续交易。
+- 用户确认交易后及时更新讨论持仓表；成交字段齐备再同步正式账本，缺失时只记已知事实及缺口。账本与券商记录不一致时按上述基线维持讨论并记录差异及影响，不虚构日期、价格、数量或费用凑平。
+- 建仓计划记录买入逻辑、结构或支撑、上方供给与预期收益空间、退出锚点及确认方式。持仓后沿用原计划，仅在新结构获得价量确认后更新锚点并保留原因；盘后将真实交易、验证结果及次日检查项归入当日笔记。
 
-```text
-daily_research/YYYY-MM-DD.md
-```
+### 9. 人工研究的数据使用
 
-- 每个研究日期只保留一份笔记；同日已有文件时在原文件中合并更新，不另建重复文件。
-- 笔记用于归档人工研究对话、持仓判断、候选股逻辑、关键价量区间、触发条件、失效条件和后续观察点。
-- `reports/daily/` 保留给流水线或脚本生成的系统日报，不存放人工投研对话归档。
-- `dev_logs/` 只记录工程开发、规则调整和故障复盘，不代替每日投研笔记。
-- 笔记中的行情、财务数据和判断应注明或隐含对应研究日期，不用后续信息改写当时结论；需要修订时追加后续验证记录。
-- `daily_research/` 属于本地研究产物，默认不纳入 Git，除非用户明确要求提交。
+- 持仓复盘、机会初筛和量价讨论默认复用本地共享行情库 `cache/market_data/market_data.sqlite` 及同日系统产物。先检查目标日覆盖、历史长度和所需字段；本地数据足够时直接研究，不因开始新一轮讨论而重新取数或重跑工作流。
+- 核验数据是检查来源、日期、单位、复权/公司行为及内部一致性，不等于再调用一次外部接口。不得仅以“金融数据需核验”或“交叉确认”为由，对完整且无具体疑点的本地行情重复调用妙想或其他外部源。
+- 补查须针对明确缺口：目标日或历史窗口缺失、字段不足、具体数据/口径冲突，或用户明确要求实时、分时或外部交叉验证。先说明缺口，再按对应模块指令和项目数据服务处理；日线补数沿用通达信主源、妙想备用源。复权冲突按既有核验流程处理，不用外部最新价绕过冲突门禁。
+- `daily_bars` 是未复权原始行情；Quant 价格、均线和结构按运行日点时前复权。跨除权日比较支撑、供给和历史高低点须统一口径，成交量须核对股/手；系统流程完成不代表每只股票数据齐备或复权均已核验，失败与缺失项单独标明。
+- Quant/Bloom/Signal Plan 以策略库 `cache/strategy/strategy_data.sqlite` 中的同日记录为权威，兼容 JSON 和报告用于读取与展示；Quant 全量研究不得以仅含入选标的的 CSV 代替。资金、财务、公告和研报先复用满足日期与时效要求的本地缓存，缺失、过期或需要新增证据时，按各模块规则调用对应数据源并保留来源与时间。
+- 本地只有日线时，不从 OHLCV 推断早盘/午后走势、成交先后或低点处的量能。用户描述的分时过程明确归为用户观察；未独立核验就保留待验证，不为完善叙述自动扩大查询范围。
 
-## 目录职责
+- 财务比较须核对报告期；模型一与模型三使用相同报告期数据，避免跨模型口径不一致。
 
-```text
-quant_lab/  # Huaxin Quant 本地运行实例
-├── instructions/      -> 云盘仓库，模型指令卡
-├── scripts/           -> 云盘仓库，模型执行脚本
-├── strategies/         -> 云盘仓库，策略 JSON 配置
-├── CLAUDE.md          -> 云盘仓库，Claude 工程规范
-├── AGENTS.md          -> Codex 工程规范
-├── TODO.md            -> 云盘仓库，项目待办
-├── dev_logs/          本地开发复盘日志（不纳入公开核心仓库）
-├── daily_research/     每日人工投研笔记（按 YYYY-MM-DD.md 归档，不纳入 Git）
-├── cache/             本地缓存（daily/xuangu/financial/research 等）
-├── pool/              模型一输出
-├── quant/             模型二输出
-├── bloom/             Bloom 信号报告与 state/
-├── macro/             全球宏观信源健康与采集摘要
-├── reports/           估值报告与 indexes/
-├── position/          本地持仓账本
-├── .tmp/              临时脚本和临时文件（用完清理）
-└── .env               本地密钥配置，不入 Git
-```
+## 编辑与收尾
 
-## 模块使用指南
+- 遵循现有风格，不引入无必要的框架，不做无关重构，不回滚用户或其他工具的改动。
+- 手工编辑使用 `apply_patch`；不用 Python 写文件，除非是更安全的批量机械转换。默认 ASCII，中文文档和既有中文文件可继续使用中文；注释只解释不直观的业务规则或兼容逻辑。
+- 较大改动在 Git feature 分支修改活跃文件；稳定后通过 commit/merge 保留历史，不靠复制文件发版。
+- 完成一组规则变更后，在 `TODO.md` 勾选完成项；验证与清理范围按本次变更确定。
 
-以下只列常用命令，详细流程、规则、字段口径和输出结构见对应指令卡、策略 JSON 和脚本实现。Codex 执行或修改某个模块前，先读对应指令卡。
+## 按任务阅读
 
-### 模型一：海选初筛（Pool）
+| 任务 | 文档 |
+|---|---|
+| 执行每日工作流、恢复与异常处理 | [WORKFLOW.md](WORKFLOW.md) |
+| 查找模块指令卡与维护约定 | [docs/README.md](docs/README.md) |
+| 盘后人工机会初筛 | [opportunity-screening.md](instructions/opportunity-screening.md) |
+| 架构、目录职责与权威存储 | [DESIGN.md](DESIGN.md) |
+| 开发任务与待实现方案 | [TODO.md](TODO.md)、[改进路线图](docs/IMPROVEMENT_ROADMAP.md) |
 
-全市场基本面过滤 + 行业排除 + 软标签评分。执行方式参考 `instructions/01-pool.md`。
-
-```bash
-python3 scripts/run_pool.py
-python3 scripts/run_pool.py --skip-fetch
-python3 scripts/run_pool.py --force-refresh
-```
-
-### 模型二：VCP 精筛（Quant）
-
-逐只识别 VCP 收缩结构、量能趋势、风险标记。执行方式参考 `instructions/02-quant.md`。
-
-```bash
-python3 scripts/quant_filter.py
-python3 scripts/quant_filter.py --code 603444
-python3 scripts/quant_filter.py --codes 300442,688676
-```
-
-### 市场状态与板块热度（Market Regime）
-
-独立的市场环境旁路层：准备共享通达信行情，计算宽基趋势、全 A 广度、板块相对强度与阶段状态；不读取或改写 Pool、Quant、Bloom 结果。执行方式参考 `instructions/market-regime.md`。
-
-```bash
-python3 scripts/market_regime.py init --lookback 300  # 首次初始化
-python3 scripts/market_regime.py update               # 盘后增量更新
-python3 scripts/market_regime.py run                  # 生成市场报告与面板数据
-python3 scripts/market_regime.py run --no-llm         # 跳过 LLM 解读
-python3 scripts/market_regime.py status               # 检查数据就绪状态
-```
-
-### 全球宏观与流动性雷达（Global Macro）
-
-独立的官方信源数据层：记录信源健康，采集美元流动性、利率、汇率、波动率代理变量和央行官方事件；不读取或改写 Pool、Quant、Bloom、Market Regime 或资金观测结果。执行方式参考 `instructions/global-macro.md`。
-
-```bash
-python3 scripts/global_macro.py probe
-python3 scripts/global_macro.py fetch
-python3 scripts/global_macro.py status --days 7
-```
-
-### Bloom 信号层
-
-消费模型二 JSON，维护跨日信号生命周期，LLM 解读重点观察标的。执行方式参考 `instructions/signal-bloom.md`。
-
-```bash
-python3 scripts/bloom.py
-python3 scripts/bloom.py --date 260706
-```
-
-### 持仓管理（Position）
-
-独立账本：交易流水、当前持仓、每日状态快照。执行方式参考 `instructions/signal-position.md`。
-
-```bash
-python3 scripts/position.py add-trade --trade-date 2026-07-06 --code 688676 --name 金盘科技 --side BUY --shares 200 --price 83.89
-python3 scripts/position.py rebuild --as-of 2026-07-06
-```
-
-### 模型三：深度估值（Valuation）
-
-LLM 拆解业务线 + 脚本 DCF/PE 计算，按需手动触发。执行方式参考 `instructions/03-valuation.md`。
-
-```bash
-# 详见 instructions/03-valuation.md
-```
-
-## 代码编辑规范
-
-- 优先遵循现有脚本风格，不引入无必要的新框架。
-- 手工编辑文件使用 `apply_patch`。
-- 不用 Python 写文件，除非是批量机械转换且比补丁更安全。
-- 默认 ASCII；中文文档和既有中文文件可继续使用中文。
-- 注释只解释不直观的业务规则或兼容逻辑。
-- 不做无关重构。
-- 不回滚用户或其他工具产生的改动。
-- 较大改动在 Git feature 分支上直接修改活跃文件；稳定后 commit/merge 保留历史，不靠复制文件发版。
-- 每次完成一组规则变更后，更新 `TODO.md` 勾掉已完成项。
-- mx-search 等 skill 并行执行后可能遗留 `tmp_*/` 目录，每次批量估值或搜索完成后清理。
+链接按源码仓库目录解析；运行实例未软链的文档从源码仓库读取，项目脚本仍从运行实例调用。模块命令、参数及实现状态在上述文档与指令卡维护，入口不重复列举。

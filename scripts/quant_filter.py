@@ -49,6 +49,11 @@ from scripts.shared import PROJECT_ROOT, VALUATION_INDEX_PATH, expected_trade_da
 from scripts.data.market_data_service import MarketDataService
 from scripts.data.strategy_data_store import connect as connect_strategy_db, load_document, save_quant
 from scripts.strategy_config import load_strategy_config
+from scripts.impulse_evidence import analyze_impulse_evidence, empty_impulse_evidence
+from scripts.quant_scoring import (
+    IncompleteStructureScore, compute_structure_score, load_profile, presentation_fields,
+)
+from scripts.impulse_score import setup_conversion
 
 
 # ===================== 配置 =====================
@@ -66,6 +71,7 @@ POST_BREAKOUT_CFG = VCP_CFG["post_breakout"]
 POST_GROUP_RESET_CFG = VCP_CFG["post_group_reset"]
 DESTRUCTIVE_RESET_CFG = VCP_CFG.get("destructive_reset", {})
 STRONG_IMPULSE_CONTEXT_CFG = VCP_CFG.get("strong_impulse_context", {})
+IMPULSE_EVIDENCE_CFG = VCP_CFG.get("impulse_evidence", {})
 POST_FAILURE_REBUILD_WATCH_CFG = POST_BREAKOUT_CFG.get("post_failure_rebuild_watch", {})
 BASE_CFG = QUANT_STRATEGY["base_rules"]
 CONTRACTION_CFG = QUANT_STRATEGY["contraction_rules"]
@@ -76,6 +82,9 @@ SCORE_CFG = QUANT_STRATEGY["scores"]
 CLASSIFICATION_CFG = QUANT_STRATEGY["classification"]
 SETUP_SCORING_CFG = QUANT_STRATEGY.get("setup_scoring", {})
 PRICE_ADJUSTMENT_CFG = QUANT_STRATEGY["price_adjustment"]
+STRUCTURE_SCORING_CFG, STRUCTURE_CALIBRATION, STRUCTURE_SCORE_POLICY_ID = load_profile(
+    QUANT_STRATEGY, IMPULSE_EVIDENCE_CFG
+)
 
 TEST_CODES = [
     "688256", "301329", "300394", "300308", "002028",
@@ -1648,6 +1657,43 @@ def detect_post_failure_rebuild_watch(df, failure_context):
     }
 
 
+def filter_contractions_by_historical_trend(df, contractions):
+    """Keep only contractions after the latest historically weak segment."""
+    annotated = []
+    eligible = []
+    for contraction in contractions:
+        item = dict(contraction)
+        anchor = df.iloc[int(item["start_idx"])]
+        ma120 = anchor.get("MA120", np.nan)
+        close = float(anchor["close"])
+        unavailable = pd.isna(ma120)
+        accepted = bool(unavailable or close >= ma120)
+        item.update({
+            "historical_trend_eligible": accepted,
+            "historical_trend_reason": (
+                "MA120_UNAVAILABLE" if unavailable else
+                "AT_OR_ABOVE_MA120" if accepted else "BELOW_MA120"
+            ),
+            "historical_trend_anchor_date": str(anchor["date"]),
+            "historical_trend_anchor_close": close,
+            "historical_trend_ma120": None if unavailable else float(ma120),
+        })
+        annotated.append(item)
+    rejected = [item for item in annotated if not item["historical_trend_eligible"]]
+    boundary = max(rejected, key=lambda item: item["end_idx"]) if rejected else None
+    for item in annotated:
+        item["historical_trend_boundary_date"] = (
+            str(df.iloc[int(boundary["end_idx"])]["date"]) if boundary else None
+        )
+        if boundary and item["start_idx"] <= boundary["end_idx"]:
+            if item["historical_trend_eligible"]:
+                item["historical_trend_reason"] = "BEFORE_TREND_RESET"
+            item["historical_trend_eligible"] = False
+        if item["historical_trend_eligible"]:
+            eligible.append(item)
+    return annotated, eligible
+
+
 def detect_vcp_structure(
     df, detect_consumed_breakout=True, enable_rebuild_discovery=True
 ):
@@ -1724,8 +1770,11 @@ def detect_vcp_structure(
     if provisional_contraction:
         raw_contractions.append(provisional_contraction)
 
+    raw_contractions, trend_contractions = filter_contractions_by_historical_trend(
+        df, raw_contractions
+    )
     baseline_current, baseline_invalid_group = select_current_vcp_group(
-        df, raw_contractions, detect_consumed_breakout=detect_consumed_breakout
+        df, trend_contractions, detect_consumed_breakout=detect_consumed_breakout
     )
     destructive_reset = detect_destructive_reset(df)
     destructive_rebuild = destructive_reset_rebuild_status(df, destructive_reset)
@@ -1734,7 +1783,7 @@ def detect_vcp_structure(
         not base_ok
         or not above_ma120
         or not destructive_reset_relevant_to_current(
-            destructive_reset, raw_contractions, baseline_current
+            destructive_reset, trend_contractions, baseline_current
         )
     ):
         destructive_reset = None
@@ -1743,12 +1792,15 @@ def detect_vcp_structure(
         contractions, groupable_contractions = annotate_contractions_for_destructive_reset(
             raw_contractions, destructive_reset, destructive_rebuild["ready"]
         )
+        groupable_contractions = [
+            item for item in groupable_contractions if item["historical_trend_eligible"]
+        ]
         selected_current, invalid_group = select_current_vcp_group(
             df, groupable_contractions, detect_consumed_breakout=detect_consumed_breakout
         )
     else:
         contractions = raw_contractions
-        groupable_contractions = raw_contractions
+        groupable_contractions = trend_contractions
         selected_current = baseline_current
         invalid_group = baseline_invalid_group
     rebuild_pending = bool(destructive_reset and not destructive_rebuild["ready"])
@@ -1867,6 +1919,9 @@ def detect_vcp_structure(
 
     if confirmed_contractions:
         conditions.append(f"历史扫描共{len(confirmed_contractions)}轮确认收缩")
+    excluded_trend_count = len(raw_contractions) - len(trend_contractions)
+    if excluded_trend_count:
+        conditions.append(f"历史MA120趋势中断，排除分界及之前{excluded_trend_count}轮收缩")
     if provisional_contraction:
         right_days = provisional_contraction["right_confirm_days"]
         required_days = provisional_contraction["required_right_confirm_days"]
@@ -1995,7 +2050,7 @@ def detect_vcp_structure(
     # Extension types strengthen an existing valid VCP only. They never create
     # a structure, change its stage, or revive a group rejected by base/risk rules.
     if has_structure and post_breakout_state == "PRE_BREAKOUT":
-        contraction_extensions = detect_contraction_extensions(df, contractions, current)
+        contraction_extensions = detect_contraction_extensions(df, groupable_contractions, current)
         extension_cfg = CONTRACTION_CFG.get("extensions", {})
         contraction_extension_score = min(
             extension_cfg.get("max_total_bonus", 0),
@@ -2208,9 +2263,16 @@ def finalize_setup_score(setup_signal, action_quality_score, action_reasons, act
     structure_quality_cfg = SETUP_SCORING_CFG.get("structure_quality", {})
     setup_structure_score = safe_float(context.get("structure_score"))
     structure_anchor_date = context.get("anchor_date", "")
+    conversion = None
+    if setup_structure_score is not None and STRUCTURE_SCORING_CFG is not None:
+        maximum = 100 + STRUCTURE_SCORING_CFG["budget"]["extension"] + STRUCTURE_SCORING_CFG["budget"].get("contraction_quality", 0)
+        conversion = setup_conversion(setup_structure_score, structure_quality_cfg, maximum)
     if setup_structure_score is None:
         structure_base = stage_cfg.get(structure.get("state"), 0)
         structure_source = "stage_fallback"
+    elif conversion is not None:
+        structure_base = conversion["normalized_base"]
+        structure_source = context.get("source", "signal_time_structure")
     else:
         structure_base = clamp(
             int(round(setup_structure_score * structure_quality_cfg.get("weight", 0.6))),
@@ -2241,7 +2303,8 @@ def finalize_setup_score(setup_signal, action_quality_score, action_reasons, act
         structure_reason = f"结构阶段兼容基础{structure_base}"
     else:
         weight = structure_quality_cfg.get("weight", 0.6)
-        structure_reason = f"结构锚点评分{round_or_none(setup_structure_score)}×{weight:.2f}={structure_base}"
+        divisor = f"/{conversion['structure_maximum']}×100" if conversion else ""
+        structure_reason = f"结构锚点评分{round_or_none(setup_structure_score)}{divisor}×{weight:.2f}={structure_base}"
     reasons = [structure_reason, f"{setup_signal}类型+{type_base}"]
     if setup_signal == "RETEST_BUY" and breakout_action_score is not None:
         weights = SETUP_SCORING_CFG.get("retest_action_weights", {})
@@ -2276,6 +2339,8 @@ def finalize_setup_score(setup_signal, action_quality_score, action_reasons, act
             "structure_source": structure_source,
         },
     }
+    if conversion is not None:
+        score_context["setup_score_components"]["structure_conversion"] = conversion
     return final_score, setup_pattern_score, reasons, misses, score_context
 
 
@@ -2939,7 +3004,7 @@ def detect_retest_buy(df, structure, overheat, code=None):
     )
 
 
-def score_setup(df, structure, pullback, retest, overheat):
+def score_setup_legacy(df, structure, pullback, retest, overheat):
     latest = df.iloc[-1]
 
     stage = structure.get("state")
@@ -3005,6 +3070,17 @@ def score_setup(df, structure, pullback, retest, overheat):
             "contraction_extensions": extension_score,
         }
     }
+
+
+def score_setup(df, structure, pullback, retest, overheat):
+    legacy = score_setup_legacy(df, structure, pullback, retest, overheat)
+    if STRUCTURE_SCORING_CFG is None:
+        return legacy
+    details = compute_structure_score(
+        df, structure, legacy, STRUCTURE_SCORING_CFG, STRUCTURE_CALIBRATION, IMPULSE_EVIDENCE_CFG,
+    )
+    return {**legacy, "structure_score": round(details["total"], 2),
+            "components": details["components"], "details": details}
 
 
 def setup_anchor_snapshot(df, event_idx):
@@ -3357,7 +3433,7 @@ def setup_reference_prices(setup_detail):
     )
 
 
-def screen(df, code=None):
+def _screen(df, code=None):
     """确定性识别 VCP 结构阶段和触发信号，返回结构化结果。"""
     latest = df.iloc[-1]
     if pd.isna(latest.get("MA20")):
@@ -3417,6 +3493,7 @@ def screen(df, code=None):
             "prior_breakout_bonus_reasons": [],
             "prior_breakout_context_tag": "",
             "vcp_quality": "D",
+            "impulse_evidence": empty_impulse_evidence("DATA_ISSUE", ["MA20_UNAVAILABLE"]),
             "contractions": [],
             "contraction_group": [],
             "destructive_reset": None,
@@ -3524,6 +3601,8 @@ def screen(df, code=None):
         "prior_breakout_bonus_reasons": structure.get("prior_breakout_bonus_reasons", []),
         "prior_breakout_context_tag": structure.get("prior_breakout_context_tag", ""),
         "vcp_quality": final_quality,
+        "impulse_evidence": (score.get("details", {}).get("impulse_evidence")
+                             or analyze_impulse_evidence(df, structure, IMPULSE_EVIDENCE_CFG)),
         "contractions": structure.get("contractions", []),
         "contraction_group": structure.get("contraction_group", []),
         "destructive_reset": structure.get("destructive_reset"),
@@ -3540,7 +3619,29 @@ def screen(df, code=None):
             "breakout": breakout.get("plan_inputs", {}),
             "retest": retest.get("plan_inputs", {}),
         },
+        **({"structure_score_details": score["details"],
+            **presentation_fields(structure, score["details"])} if "details" in score else {}),
     }
+
+
+def screen(df, code=None):
+    try:
+        result = _screen(df, code=code)
+    except IncompleteStructureScore as exc:
+        # Reuse the existing DATA_ISSUE contract without a legacy-score fallback.
+        invalid = df.copy()
+        invalid.loc[invalid.index[-1], "MA20"] = np.nan
+        result = _screen(invalid, code=code)
+        result.update(reason=f"V10评分数据不完整：{exc}", structure_misses=exc.details["reasons"],
+                      setup_misses=exc.details["reasons"], structure_score_details=exc.details)
+    if STRUCTURE_SCORING_CFG is not None:
+        result.update(
+            structure_score_policy_id=STRUCTURE_SCORE_POLICY_ID,
+            structure_score_calibration_date=STRUCTURE_CALIBRATION["calibration_date"],
+            structure_score_maximum=118,
+            structure_scoring_status="INCOMPLETE" if result["structure_stage"] == "DATA_ISSUE" else "COMPLETE",
+        )
+    return result
 
 
 # ===================== 输出 =====================
@@ -3565,7 +3666,9 @@ CSV_COLUMNS = [
     "distance_ma20", "distance_ma60", "distance_high_60",
     "chg_5", "chg_20", "price_mode", "adjustment_status", "factor_version",
     "applied_action_count", "latest_corporate_action_date",
-    "reason", "run_date", "strategy_version",
+    "reason", "run_date", "strategy_version", "impulse_evidence",
+    "structure_score_policy_id", "structure_score_calibration_date", "structure_score_maximum",
+    "structure_scoring_status", "structure_score_details", "contraction_quality_score", "contraction_quality_tags",
 ]
 
 
@@ -3705,6 +3808,14 @@ def write_csv(results, quant_path):
                 r["reason"],
                 r["run_date"],
                 r["strategy_version"],
+                json.dumps(r.get("impulse_evidence", {}), ensure_ascii=False, separators=(",", ":")),
+                r.get("structure_score_policy_id", ""),
+                r.get("structure_score_calibration_date", ""),
+                r.get("structure_score_maximum", ""),
+                r.get("structure_scoring_status", ""),
+                json.dumps(r.get("structure_score_details", {}), ensure_ascii=False, separators=(",", ":")),
+                r.get("contraction_quality_score", 0),
+                ";".join(r.get("contraction_quality_tags", [])),
             ])
     print(f"\n精选池已输出: {quant_path}")
 
@@ -3798,7 +3909,7 @@ def maybe_call_llm(results, top_n):
     if not results:
         return {"status": "skipped", "reason": "no_results", "reviews": []}
     api_key = os.environ.get("DEEPSEEK_API_KEY")
-    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
     base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
     if not api_key:
         return {"status": "skipped", "reason": "DEEPSEEK_API_KEY missing", "reviews": []}
@@ -3985,8 +4096,8 @@ def main():
     parser.add_argument("--include-reject", action="store_true", help="CSV 中包含未纳入 model2_include 的标的")
     parser.add_argument("--no-cache", action="store_true", help="跳过缓存，重新拉取行情")
     parser.add_argument("--refresh", action="store_true", help="强制刷新候选标的近期日线后重新计算")
-    parser.add_argument("--with-llm", action="store_true", help="可选调用 LLM 对 top 标的做解释")
-    parser.add_argument("--llm-top", type=int, default=10, help="LLM 解释 Top N，默认 10")
+    parser.add_argument("--with-llm", action="store_true", help="兼容参数：LLM 文字解读已暂停，传入也跳过")
+    parser.add_argument("--llm-top", type=int, default=10, help="兼容参数：LLM 文字解读已暂停")
     parser.add_argument("--progress-file", help="进度文件路径（供 daily.py 流水线使用）")
     args = parser.parse_args()
 
@@ -4018,11 +4129,9 @@ def main():
         print("提示：强制从主备源刷新候选标的近期日线")
 
     results, stats = process_codes(codes, today_yy, run_date, use_cache=use_cache, progress_file=args.progress_file)
-    llm_results = [r for r in results if should_write_to_quant(r, include_reject=args.include_reject)]
-    llm_results.sort(key=lambda x: x["structure_score"], reverse=True)
-    llm_payload = {"status": "skipped", "reason": "not_requested", "reviews": []}
+    llm_payload = {"status": "skipped", "reason": "disabled", "reviews": []}
     if args.with_llm:
-        llm_payload = maybe_call_llm(llm_results, args.llm_top)
+        print("提示：Quant LLM 文字解读已暂停，跳过 --with-llm")
 
     payload = {
         "meta": {
@@ -4033,6 +4142,9 @@ def main():
             "schema": "quant_vcp_structure_v2",
             "strategy_version": STRATEGY_VERSION,
             "strategy_file": f"strategies/{QUANT_STRATEGY_FILE}",
+            "structure_score_policy_id": STRUCTURE_SCORE_POLICY_ID,
+            "structure_score_calibration_date": (STRUCTURE_CALIBRATION or {}).get("calibration_date"),
+            "structure_score_profile_file": QUANT_STRATEGY.get("structure_scoring", {}).get("profile_file"),
             "price_mode": PRICE_ADJUSTMENT_CFG["mode"],
             "adjustment_factor_version": PRICE_ADJUSTMENT_CFG["factor_version"],
             "corporate_action_source": PRICE_ADJUSTMENT_CFG["primary_source"],

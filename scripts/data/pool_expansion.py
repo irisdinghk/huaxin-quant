@@ -40,7 +40,9 @@ def build_expansion_pool(
     as_of: str,
     config: dict,
     core_codes: set[str] | None = None,
+    tracked_codes: set[str] | None = None,
     db_path: str | Path = DB_PATH,
+    liquidity_exempt_codes: set[str] | None = None,
 ) -> tuple[list[dict], dict]:
     """Build RS top-N, then apply hard filters without rank backfilling.
 
@@ -48,6 +50,8 @@ def build_expansion_pool(
     core quality channel. Expansion-only rows are explicitly unverified.
     """
     core_codes = core_codes or set()
+    tracked_codes = tracked_codes or set()
+    liquidity_exempt_codes = (liquidity_exempt_codes or set()) & tracked_codes
     if not config.get("enabled", False):
         return [], {"enabled": False, "final_total": 0}
 
@@ -137,13 +141,18 @@ def build_expansion_pool(
     )
     ranked = ranked.sort_values(
         ["expansion_score", "code"], ascending=[False, True], kind="mergesort"
-    ).head(top_n).copy()
+    ).copy()
     ranked["rs_rank"] = range(1, len(ranked) + 1)
+    ranked["rs_rank_eligible"] = ranked["rs_rank"] <= top_n
+    selected = ranked[
+        ranked["rs_rank_eligible"] | ranked["code"].isin(tracked_codes)
+    ].copy()
 
     rejected = Counter()
     passed = []
-    for row in ranked.to_dict("records"):
+    for row in selected.to_dict("records"):
         reason = ""
+        liquidity_exempt = False
         if hard.get("require_universe_eligible", True) and (not row["eligible"] or row["is_st"]):
             reason = row["exclusion_reason"] or "UNIVERSE_INELIGIBLE"
         elif row["last_trade_date"] != as_of:
@@ -153,9 +162,20 @@ def build_expansion_pool(
         elif row["active_sessions_20"] < int(hard["minimum_active_sessions_20"]):
             reason = "INSUFFICIENT_ACTIVE_SESSIONS"
         elif row["average_amount_20"] < float(hard["minimum_average_amount_20"]):
-            reason = "LOW_LIQUIDITY"
-        if reason:
+            if row["code"] in liquidity_exempt_codes:
+                liquidity_exempt = True
+            else:
+                reason = "LOW_LIQUIDITY"
+        rank_eligible = bool(row.pop("rs_rank_eligible"))
+        row["hard_filter_reason"] = reason
+        row["liquidity_filter_exempt"] = liquidity_exempt
+        row["liquidity_structure_active"] = row["code"] in liquidity_exempt_codes
+        row["rs_current_eligible"] = rank_eligible and not reason and not liquidity_exempt
+        if reason and rank_eligible:
             rejected[reason] += 1
+        if reason:
+            if row["code"] in tracked_codes:
+                passed.append(row)
             continue
         row["pool_channel"] = "BOTH" if row["code"] in core_codes else "EXPANSION_RS"
         row["fundamental_status"] = (
@@ -163,14 +183,40 @@ def build_expansion_pool(
         )
         passed.append(row)
 
-    overlap = sum(1 for row in passed if row["code"] in core_codes)
+    available_codes = set(ranked["code"].astype(str))
+    for code in sorted(tracked_codes - available_codes):
+        passed.append({
+            "code": code,
+            "name": "",
+            "industry": "",
+            "rs_rank": None,
+            "expansion_score": None,
+            "rs_short_percentile": None,
+            "rs_long_percentile": None,
+            "return_short_pct": None,
+            "return_long_pct": None,
+            "average_amount_20": None,
+            "history_sessions": 0,
+            "active_sessions_20": 0,
+            "rs_current_eligible": False,
+            "hard_filter_reason": "DATA_UNAVAILABLE",
+            "liquidity_filter_exempt": False,
+            "liquidity_structure_active": False,
+            "pool_channel": "EXPANSION_RS",
+            "fundamental_status": config["unverified_fundamental_tag"],
+        })
+
+    current_passed = [row for row in passed if row["rs_current_eligible"] and not row["hard_filter_reason"]]
+    overlap = sum(1 for row in current_passed if row["code"] in core_codes)
     return passed, {
         "enabled": True,
         "rankable_total": int(len(records)),
-        "initial_top_total": int(len(ranked)),
+        "initial_top_total": min(top_n, int(len(ranked))),
         "rejected": dict(sorted(rejected.items())),
-        "passed_after_filters": len(passed),
+        "passed_after_filters": len(current_passed),
         "core_overlap_total": overlap,
-        "expansion_only_total": len(passed) - overlap,
-        "final_total": len(passed),
+        "expansion_only_total": len(current_passed) - overlap,
+        "tracked_metrics_total": len(passed) - len(current_passed),
+        "liquidity_exempt_total": sum(row["liquidity_filter_exempt"] for row in passed),
+        "final_total": len(current_passed),
     }

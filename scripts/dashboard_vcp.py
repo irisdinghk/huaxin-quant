@@ -224,6 +224,9 @@ def compact_candidate(row: dict, quant: dict, industry: dict) -> dict:
     result["contraction_extension_tags"] = quant.get("contraction_extension_tags", []) or []
     result["contraction_extension_score"] = quant.get("contraction_extension_score", 0) or 0
     result["contraction_extensions"] = quant.get("contraction_extensions", []) or []
+    for field in ("structure_score_policy_id", "structure_score_calibration_date", "structure_score_maximum",
+                  "structure_scoring_status", "structure_score_details", "contraction_quality_score", "contraction_quality_tags"):
+        result[field] = quant.get(field)
     result["volume_pattern"] = display_vcp_text(result.get("volume_pattern"))
     result["structure_conditions"] = display_vcp_text(result["structure_conditions"])
     result["structure_misses"] = display_vcp_text(result["structure_misses"])

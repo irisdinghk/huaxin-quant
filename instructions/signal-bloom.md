@@ -1,7 +1,7 @@
 # Signal Bloom：模型四 Bloom 信号层指令卡
 
 - **版本管理**: 由 Git 分支与提交历史管理
-- **最近更新**: 2026-08-21
+- **最近更新**: 2026-10-06（评分口径切换门禁）
 - **所属模型**: 模型四 Tracker
 - **策略配置**: `strategies/04-bloom.json`
 - **核心目标**: 对模型二发现的股票进行信号质量判断和跨日生命周期跟踪，输出观察状态、风险阻断、估值候选和下一步观察点。
@@ -31,6 +31,9 @@ Bloom 不负责：
 ---
 
 ## 二、输入
+
+权威来源核对（2026-09-08）：优先读取 cache/strategy/strategy_data.sqlite 的同日 Quant 与已有 Bloom 状态；下列 JSON/CSV/JSONL 是兼容发布与迁移回退，不再是唯一账本。先提交数据库后发布文件，见 [strategy-data.md](strategy-data.md)。
+
 
 Bloom 以模型二 JSON 为权威输入：
 
@@ -76,6 +79,8 @@ structure_valid
 structure_invalid_reason
 reason
 ```
+
+Quant评分口径由`structure_score_policy_id`声明，Bloom状态和事件保存该ID与`quant_strategy_version`。跨口径（含旧记录缺ID）时`score_change`留空、`structure_score_policy_changed=true`，不因分数断点产生UPGRADE/DOWNGRADE；当日结构阶段、真实失效、风险与买点仍按原规则处理。最佳分数按新口径重新建立，旧历史快照不回写；同口径恢复正常分差计算，数值0是有效分数。缺数/缺席跟踪行保留原评分ID，不冒充新策略计算。
 
 Bloom 可读取自身历史状态：
 
@@ -263,7 +268,7 @@ valuation_priority
 | `LOW` | `EARLY` 或结构还不稳定 |
 | `NONE` | `INVALID` / `EXIT` / `DATA_ISSUE` / `RISK_BLOCKED` |
 
-`valuation_candidate=true` 仅表示值得进入估值触发层排队，不表示估值通过，也不表示可以买入。
+`valuation_candidate=true` 仅表示研究候选，不表示估值通过，也不表示可以买入。自动估值队列尚未实现；当前模型三由用户主动指定标的运行。
 
 ---
 
@@ -388,6 +393,7 @@ Markdown 的“重点观察”表格列为：
 
 LLM 观察要点：
 
+- 当前暂停文字解读：`reporting.llm_enabled=false`，不发送 LLM 请求，summary 记录 `status=skipped`、`reason=disabled`、请求数为 0；报告使用规则生成的 `watch_reason`。以下调用约定仅在重新启用后适用，历史解读不删除。
 - Bloom 可调用 DeepSeek 为重点观察标的生成 `llm_insight`。
 - 只有 `structure_score >= 70` 的重点观察标的才调用 LLM；低于门槛的标的继续保留在重点观察列表，并使用脚本生成的 `watch_reason`，不得改变其 Bloom 状态、买点或排序。
 - 传给 LLM 的上下文必须包含 `model2_setup_signal`、`setup_score`、`setup_quality`、`setup_reasons`、`setup_misses` 和 `suggested_position`，观察要点应考虑买点类型与质量。
