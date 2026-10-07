@@ -368,6 +368,8 @@ def main():
     parser.add_argument("--date", help="运行日期 YYMMDD 或 YYYY-MM-DD")
     parser.add_argument("--skip-pool", action="store_true", help="跳过模型一，复用已有池子")
     parser.add_argument("--force-refresh", action="store_true", help="强制刷新数据缓存")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="不自动打开面板（无人值守/计划任务用，避免弹窗打扰）")
     args = parser.parse_args()
 
     try:
@@ -564,14 +566,18 @@ def main():
 
     # ── Step 11: Open dashboard ──
     tracker.step_start("open_dashboard")
-    print("[daily] → 打开数据分析面板")
-    result = open_dashboard()
-    if not result:
-        tracker.step_degraded("open_dashboard", "browser open failed")
-        print("[daily] [WARN] 无法自动打开浏览器，页面数据已生成")
+    if args.no_browser:
+        tracker.step_skipped("open_dashboard", "no-browser")
+        print("[daily] - 跳过打开面板 (--no-browser)")
     else:
-        tracker.step_done("open_dashboard")
-        print("[daily] [OK] dashboard opened")
+        print("[daily] → 打开数据分析面板")
+        result = open_dashboard()
+        if not result:
+            tracker.step_degraded("open_dashboard", "browser open failed")
+            print("[daily] [WARN] 无法自动打开浏览器，页面数据已生成")
+        else:
+            tracker.step_done("open_dashboard")
+            print("[daily] [OK] dashboard opened")
 
     # ── Step 12: Eastmoney all-watchlist rebuild ──
     if not _env_flag("ENABLE_ZIXUAN_SYNC"):

@@ -289,6 +289,30 @@ class MiaoxiangSource(DataSource):
 
 # ===================== 通达信数据源（mootdx，主） =====================
 
+class TdxPytdxClient:
+    """pytdx 客户端适配器 —— 暴露与 mootdx client 兼容的 xdxr() 接口。
+
+    背景（2026-09-16）：mootdx 的 bars() 对所有服务器返回 0 行，
+    导致 _get_client() 判定 10 台服务器全部不可用，
+    backtest.py 取除权数据时必然抛 "通达信连接失败"。
+    pytdx 直连同一批服务器完全正常（前端筛选 01-screen1.py 一直在用），
+    故此处提供适配器，字段与 mootdx 保持一致：
+      category / fenhong / songzhuangu / peigu / peigujia / year / month / day
+    """
+
+    def __init__(self, api, ip, port):
+        self._api = api
+        self.ip = ip
+        self.port = port
+
+    def xdxr(self, symbol=None, code=None):
+        """返回该股除权除息事件的 DataFrame（与 mootdx 结构兼容）。"""
+        target = symbol or code
+        market = 1 if str(target).startswith("6") else 0
+        records = self._api.get_xdxr_info(market, target)
+        return pd.DataFrame(records or [])
+
+
 class TDXSource(DataSource):
     """通达信数据源，基于 mootdx 库连接公共行情服务器。
 
@@ -297,6 +321,9 @@ class TDXSource(DataSource):
     取延迟最低的服务器直连。不同于 factory(bestip=True)，
     后者用 sync=True 探测后立即建连，会被服务器限流。
     依赖: pip install 'mootdx[all]'
+
+    注意：_get_client() 优先返回 pytdx 适配器，仅当 pytdx 不可用时
+    回退 mootdx（见 _get_client 注释）。
     """
 
     display_name = "tdx"
@@ -328,14 +355,58 @@ class TDXSource(DataSource):
             pass
 
     def _get_client(self):
-        """获取或创建 mootdx 客户端。
+        """获取或创建行情客户端。
 
-        1. sync=False 轻量探测（和 CLI 一致）→ 直连最快服务器
-        2. 探测失败 → 回退到缓存文件中的上次可用服务器
+        优先级（2026-09-16 调整）：
+        1. **pytdx 适配器** — 直连 TDX 服务器，已验证稳定可靠。
+           mootdx 的 bars() 坏了之后，这是唯一能拿到 xdxr 的路径。
+        2. mootdx — 仅当 pytdx 不可用时回退（保留原逻辑以备上游修复）。
+
+        pytdx 是同步阻塞库，用锁串行化访问。
         """
         if self._client is not None:
             return self._client
 
+        client = self._build_pytdx_client()
+        if client is not None:
+            self._client = client
+            return client
+
+        return self._build_mootdx_client()
+
+    def _build_pytdx_client(self):
+        """用 pytdx 建连，成功返回适配器，失败返回 None。"""
+        try:
+            from pytdx.hq import TdxHq_API
+        except ImportError:
+            return None
+
+        candidates = self._load_cached_servers() or [
+            ("180.153.18.170", 7709),
+            ("60.12.136.250", 7709),
+            ("115.238.56.198", 7709),
+        ]
+        for ip, port in candidates:
+            api = TdxHq_API()
+            try:
+                if not api.connect(ip, port):
+                    continue
+                # 用真实请求验证：拿 000001 的除权数据（xdxr 是我们要用的接口）
+                probe = api.get_xdxr_info(0, "000001")
+                if probe:
+                    self._save_cached_servers([(ip, port)])
+                    return TdxPytdxClient(api, ip, port)
+                api.disconnect()
+            except Exception:
+                try:
+                    api.disconnect()
+                except Exception:
+                    pass
+                continue
+        return None
+
+    def _build_mootdx_client(self):
+        """回退路径：原 mootdx 逻辑（服务器探测 → 逐个试连）。"""
         from mootdx.server import server as probe_servers
         from mootdx.quotes import Quotes
 
